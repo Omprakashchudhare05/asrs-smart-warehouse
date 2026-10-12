@@ -8,22 +8,34 @@ let refreshInterval = null;
 const $ = id => document.getElementById(id);
 
 const menus = {
-  boss: [
+  owner: [
     ['dashboard', '▣', 'Dashboard'],
-    ['inventory', '▤', 'Inventory Management'],
-    ['rack', '▦', 'Rack / Slots'],
+    ['inventory', '▤', 'Inventory'],
+    ['rack', '▦', 'Dynamic Rack'],
     ['history', '◷', 'History'],
-    ['operators', '♟', 'Operators'],
-    ['reports', '▥', 'Reports'],
-    ['settings', '⚙', 'Settings']
+    ['approvals', '✓', 'Approval Queue'],
+    ['admin_mgmt', '♟', 'Admin Management'],
+    ['users', '👥', 'User Management'],
+    ['settings', '⚙', 'Settings & Hardware']
+  ],
+  admin: [
+    ['dashboard', '▣', 'Dashboard'],
+    ['inventory', '▤', 'Warehouse Inventory'],
+    ['history', '◷', 'History'],
+    ['approvals', '✓', 'Operator Approvals'],
+    ['operator_mgmt', '♟', 'Operator Management'],
+    ['profile', '👤', 'My Profile']
   ],
   operator: [
     ['dashboard', '▣', 'Dashboard'],
-    ['inventory', '▤', 'Inventory Management'],
-    ['rack', '▦', 'Rack / Slots'],
-    ['history', '◷', 'History']
+    ['store', '📥', 'Store Stock'],
+    ['retrieve', '📤', 'Retrieve Stock'],
+    ['inventory', '▤', 'Inventory Search'],
+    ['history', '◷', 'My Movements'],
+    ['profile', '👤', 'My Profile']
   ]
 };
+menus.boss = menus.owner;
 
 async function raw(path, opt = {}) {
   const r = await fetch(BACKEND + path, {
@@ -64,6 +76,7 @@ async function init() {
       $('enterBtn').onclick = login;
 
       setupForgotPassHandlers();
+      setupRegistrationHandlers();
 
       // Check for saved session in sessionStorage for seamless re-opening
       const savedToken = sessionStorage.getItem('asrsToken');
@@ -339,6 +352,152 @@ function startCountdown(timerId, btnId, totalSec, cooldownSec, resendCallback) {
   }
 }
 
+const roleLabels = {
+  owner: 'Owner / Super Admin',
+  boss: 'Owner / Super Admin',
+  admin: 'Admin / Warehouse Manager',
+  operator: 'Warehouse Operator'
+};
+
+function setupRegistrationHandlers() {
+  const opLink = $('opRegLink');
+  const adminLink = $('adminRegLink');
+  const backLinks = document.querySelectorAll('.regBackLink');
+
+  if (opLink) {
+    opLink.onclick = (e) => {
+      e.preventDefault();
+      $('loginFields').classList.add('hidden');
+      $('forgotFields').classList.add('hidden');
+      $('adminRegFields').classList.add('hidden');
+      $('opRegFields').classList.remove('hidden');
+      $('enterBtn').classList.add('hidden');
+      $('roleChoice')?.classList.add('hidden');
+      $('loginNote')?.classList.add('hidden');
+      $('loginFooterLinks')?.classList.add('hidden');
+      $('loginTitle').textContent = 'Apply for Operator Access';
+      $('loginHint').textContent = 'Submit your application for warehouse operator access.';
+      $('loginError').textContent = '';
+    };
+  }
+
+  if (adminLink) {
+    adminLink.onclick = (e) => {
+      e.preventDefault();
+      $('loginFields').classList.add('hidden');
+      $('forgotFields').classList.add('hidden');
+      $('opRegFields').classList.add('hidden');
+      $('adminRegFields').classList.remove('hidden');
+      $('enterBtn').classList.add('hidden');
+      $('roleChoice')?.classList.add('hidden');
+      $('loginNote')?.classList.add('hidden');
+      $('loginFooterLinks')?.classList.add('hidden');
+      $('loginTitle').textContent = 'Apply for Admin Access';
+      $('loginHint').textContent = 'Submit your application for warehouse manager access.';
+      $('loginError').textContent = '';
+    };
+  }
+
+  backLinks.forEach(b => {
+    b.onclick = (e) => {
+      e.preventDefault();
+      $('opRegFields').classList.add('hidden');
+      $('adminRegFields').classList.add('hidden');
+      $('forgotFields').classList.add('hidden');
+      $('loginFields').classList.remove('hidden');
+      $('enterBtn').classList.remove('hidden');
+      $('roleChoice')?.classList.remove('hidden');
+      $('loginNote')?.classList.remove('hidden');
+      $('loginFooterLinks')?.classList.remove('hidden');
+      $('loginTitle').textContent = 'Welcome back';
+      $('loginHint').textContent = 'Sign in to your warehouse control center.';
+      $('loginError').textContent = '';
+    };
+  });
+
+  const opSubmitBtn = $('opRegSubmitBtn');
+  if (opSubmitBtn) {
+    opSubmitBtn.onclick = async () => {
+      try {
+        $('loginError').textContent = '';
+        const userId = $('opRegUser').value.trim();
+        const displayName = $('opRegName').value.trim();
+        const password = $('opRegPass').value;
+        const email = $('opRegEmail').value.trim();
+        const phone = $('opRegPhone').value.trim();
+        const employeeId = $('opRegEmpId').value.trim();
+        const registrationReason = $('opRegReason').value.trim();
+
+        if (!userId || !displayName || !password) throw Error('User ID, Display Name, and Password (8+ chars) are required');
+        opSubmitBtn.disabled = true;
+        opSubmitBtn.textContent = 'Submitting application...';
+
+        const res = await raw('/auth/register/operator', {
+          method: 'POST',
+          body: JSON.stringify({ userId, displayName, password, email, phone, employeeId, registrationReason })
+        });
+
+        toast(res.message);
+        $('opRegFields').classList.add('hidden');
+        $('loginFields').classList.remove('hidden');
+        $('enterBtn').classList.remove('hidden');
+        $('roleChoice')?.classList.remove('hidden');
+        $('loginNote')?.classList.remove('hidden');
+        $('loginFooterLinks')?.classList.remove('hidden');
+        $('loginTitle').textContent = 'Application Submitted';
+        $('loginHint').textContent = 'Your operator application is pending administrator approval.';
+        $('loginError').textContent = res.message;
+      } catch (err) {
+        $('loginError').textContent = err.message;
+      } finally {
+        opSubmitBtn.disabled = false;
+        opSubmitBtn.textContent = 'Submit Operator Application →';
+      }
+    };
+  }
+
+  const adminSubmitBtn = $('adminRegSubmitBtn');
+  if (adminSubmitBtn) {
+    adminSubmitBtn.onclick = async () => {
+      try {
+        $('loginError').textContent = '';
+        const userId = $('adminRegUser').value.trim();
+        const displayName = $('adminRegName').value.trim();
+        const password = $('adminRegPass').value;
+        const email = $('adminRegEmail').value.trim();
+        const phone = $('adminRegPhone').value.trim();
+        const organization = $('adminRegOrg').value.trim();
+        const registrationReason = $('adminRegReason').value.trim();
+
+        if (!userId || !displayName || !password || !email) throw Error('User ID, Full Name, Password (8+ chars), and Email are required');
+        adminSubmitBtn.disabled = true;
+        adminSubmitBtn.textContent = 'Submitting application...';
+
+        const res = await raw('/auth/register/admin', {
+          method: 'POST',
+          body: JSON.stringify({ userId, displayName, password, email, phone, organization, registrationReason })
+        });
+
+        toast(res.message);
+        $('adminRegFields').classList.add('hidden');
+        $('loginFields').classList.remove('hidden');
+        $('enterBtn').classList.remove('hidden');
+        $('roleChoice')?.classList.remove('hidden');
+        $('loginNote')?.classList.remove('hidden');
+        $('loginFooterLinks')?.classList.remove('hidden');
+        $('loginTitle').textContent = 'Application Submitted';
+        $('loginHint').textContent = 'Your admin application is pending Owner / Super Admin approval.';
+        $('loginError').textContent = res.message;
+      } catch (err) {
+        $('loginError').textContent = err.message;
+      } finally {
+        adminSubmitBtn.disabled = false;
+        adminSubmitBtn.textContent = 'Submit Admin Application →';
+      }
+    };
+  }
+}
+
 async function login() {
   try {
     const d = await raw('/auth/login', {
@@ -348,10 +507,6 @@ async function login() {
         password: $('loginPass').value
       })
     });
-    const chosenRole = window.getChosenRole ? window.getChosenRole() : 'boss';
-    if (d.user.role !== chosenRole) {
-      throw Error(`This account role is '${d.user.role}', but you selected '${chosenRole}'. Please select '${d.user.role}'.`);
-    }
     token = d.token;
     me = d.user;
     sessionStorage.setItem('asrsToken', token);
@@ -368,7 +523,7 @@ function showApp() {
   $('login').classList.add('hidden');
   $('app').classList.remove('hidden');
   $('userName').textContent = me.displayName;
-  $('userRole').textContent = me.role === 'boss' ? 'Boss / Administrator' : 'Warehouse Operator';
+  $('userRole').textContent = roleLabels[me.role] || 'Warehouse User';
   $('avatar').textContent = (me.displayName || 'U')[0].toUpperCase();
   buildNav();
   navigate('dashboard');
@@ -400,22 +555,61 @@ function navigate(p) {
   render();
 }
 
+let pendingAdminsList = [];
+let pendingOpsList = [];
+let approvedAdminsList = [];
+let approvedOpsList = [];
+let txFromFilter = '';
+let txToFilter = '';
+
 async function load() {
   try {
+    let txUrl = '/transactions';
+    const qParams = [];
+    if (txFromFilter) qParams.push(`from=${encodeURIComponent(txFromFilter)}`);
+    if (txToFilter) qParams.push(`to=${encodeURIComponent(txToFilter)}`);
+    if (qParams.length) txUrl += '?' + qParams.join('&');
+
     const [slotsData, txData] = await Promise.all([
       api('/slots'),
-      api('/transactions')
+      api(txUrl)
     ]);
     slots = slotsData;
     transactions = txData;
-    if (me.role === 'boss') {
-      if (page === 'operators') users = await api('/users');
-      if (page === 'settings') {
+    if (page === 'users' && (me.role === 'owner' || me.role === 'boss')) {
+      try { users = await api('/users'); } catch {}
+    }
+    if (page === 'admin_mgmt' && (me.role === 'owner' || me.role === 'boss')) {
+      try {
+        const resA = await api('/api/owner/admins');
+        approvedAdminsList = resA.admins || [];
+      } catch {}
+    }
+    if (page === 'operator_mgmt' && (me.role === 'admin' || me.role === 'owner' || me.role === 'boss')) {
+      try {
+        const resO = await api('/api/admin/operators');
+        approvedOpsList = resO.operators || [];
+      } catch {}
+    }
+    if (page === 'approvals') {
+      if (me.role === 'owner' || me.role === 'boss') {
         try {
-          const hw = await api('/hardware/key');
-          hardwareKey = hw.hardwareApiKey;
+          const resA = await api('/api/owner/pending-admins');
+          pendingAdminsList = resA.requests || [];
         } catch {}
       }
+      if (me.role === 'owner' || me.role === 'boss' || me.role === 'admin') {
+        try {
+          const resO = await api('/api/admin/pending-operators');
+          pendingOpsList = resO.requests || [];
+        } catch {}
+      }
+    }
+    if (page === 'settings' && (me.role === 'owner' || me.role === 'boss')) {
+      try {
+        const hw = await api('/hardware/key');
+        hardwareKey = hw.hardwareApiKey;
+      } catch {}
     }
     render();
   } catch (e) {
@@ -628,9 +822,13 @@ function inventory() {
                 <td>${s.capacity}</td>
                 <td><span class="badge ${s.quantity === 0 ? 'red' : s.quantity >= s.capacity ? 'orange' : 'green'}">${s.status}</span></td>
                 <td>
-                  <button class="primary saveProduct" data-slot="${s.slot}">Save</button>
-                  <button class="ghost action" data-action="store" data-slot="${s.slot}">📥 Store</button>
-                  <button class="ghost action" data-action="retrieve" data-slot="${s.slot}">📤 Retrieve</button>
+                  ${me.role === 'operator' ? `
+                    <button class="ghost action" data-action="store" data-slot="${s.slot}">📥 Store</button>
+                    <button class="ghost action" data-action="retrieve" data-slot="${s.slot}">📤 Retrieve</button>
+                  ` : `
+                    <button class="primary saveProduct" data-slot="${s.slot}">Save</button>
+                    <span class="badge" style="background:#f1f5f9;color:#64748b;margin-left:6px;" title="Movement execution restricted to floor Operators">Floor Operator Only</span>
+                  `}
                 </td>
               </tr>
             `}).join('')}
@@ -668,54 +866,87 @@ function historyPage() {
       (t.item_name || '').toLowerCase().includes(f) ||
       (t.sku || '').toLowerCase().includes(f) ||
       (t.action || '').toLowerCase().includes(f) ||
-      (t.source || '').toLowerCase().includes(f)
+      (t.source || '').toLowerCase().includes(f) ||
+      (t.user_name || '').toLowerCase().includes(f) ||
+      (t.user_id || '').toLowerCase().includes(f)
     );
   }
   return `
     <div class="panel">
       <div class="panel-head">
         <div>
-          <h3>Warehouse Transaction History</h3>
-          <span class="muted">Total Transactions Logged: ${transactions.length}</span>
+          <h3>${me.role === 'operator' ? 'My Movement History' : 'Warehouse Transaction History'}</h3>
+          <span class="muted">Total Logged: ${transactions.length} record(s)${txFromFilter || txToFilter ? ` (Filtered: ${txFromFilter || 'Earliest'} to ${txToFilter || 'Latest'})` : ''}</span>
         </div>
         <div style="display:flex;gap:10px;">
-          <input class="search" id="histSearchInput" placeholder="🔍 Search transaction history..." value="${esc(historyFilter)}">
+          <input class="search" id="histSearchInput" placeholder="🔍 Search current list..." value="${esc(historyFilter)}">
           <button class="primary" id="refresh">↻ Refresh</button>
         </div>
       </div>
+
+      <!-- DATE FILTER & EXCEL TOOLBAR -->
+      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;margin-bottom:12px;border-radius:6px;">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:13px;">
+          <span style="font-weight:600;color:#475569;">Filter by Date:</span>
+          <label style="display:flex;align-items:center;gap:6px;margin:0;">
+            <span class="muted">From:</span>
+            <input type="date" id="txFromDate" value="${esc(txFromFilter)}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;margin:0;">
+            <span class="muted">To:</span>
+            <input type="date" id="txToDate" value="${esc(txToFilter)}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;">
+          </label>
+          <button class="primary" id="txApplyFilter" style="padding:7px 14px;font-size:13px;">Apply Filter</button>
+          ${txFromFilter || txToFilter ? `<button class="ghost" id="txClearFilter" style="padding:7px 12px;font-size:13px;">✕ Clear Filter</button>` : ''}
+        </div>
+        <div>
+          <button id="txExportExcel" class="primary" style="background:#059669;color:#fff;border-color:#059669;padding:7px 16px;font-size:13px;display:flex;align-items:center;gap:6px;">
+            <span>📊</span><span>Download Excel (.xlsx)</span>
+          </button>
+        </div>
+      </div>
+
       <div class="table-wrap">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Action</th>
-              <th>Product</th>
-              <th>SKU</th>
-              <th>Slot</th>
-              <th>Qty</th>
-              <th>Before</th>
-              <th>After</th>
-              <th>User</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${list.map(t => `
+        ${list.length ? `
+          <table class="table">
+            <thead>
               <tr>
-                <td>${t.time || ''}</td>
-                <td><span class="badge ${t.action === 'STORE' ? 'green' : 'orange'}">${t.action}</span></td>
-                <td>${esc(t.item_name || 'Item ' + t.item)}</td>
-                <td>${esc(t.sku || '—')}</td>
-                <td><b>${t.slot}</b></td>
-                <td><b>${t.quantity}</b></td>
-                <td>${t.before_quantity}</td>
-                <td>${t.after_quantity}</td>
-                <td>${esc(t.user_name || 'System')}</td>
-                <td><small class="muted">${esc(t.source || 'dashboard')}</small></td>
+                <th>Time</th>
+                <th>Action</th>
+                <th>Product</th>
+                <th>SKU</th>
+                <th>Slot</th>
+                <th>Qty</th>
+                <th>Before</th>
+                <th>After</th>
+                <th>User</th>
+                <th>Source</th>
               </tr>
-            `).join('')}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              ${list.map(t => `
+                <tr>
+                  <td>${t.time || ''}</td>
+                  <td><span class="badge ${t.action === 'STORE' ? 'green' : 'orange'}">${t.action}</span></td>
+                  <td>${esc(t.item_name || 'Item ' + t.item)}</td>
+                  <td>${esc(t.sku || '—')}</td>
+                  <td><b>${t.slot}</b></td>
+                  <td><b>${t.quantity}</b></td>
+                  <td>${t.before_quantity}</td>
+                  <td>${t.after_quantity}</td>
+                  <td>${esc(t.user_name || t.user_id || 'System')}</td>
+                  <td><small class="muted">${esc(t.source || 'dashboard')}</small></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        ` : `
+          <div style="text-align:center;padding:40px 20px;color:#64748b;">
+            <div style="font-size:32px;margin-bottom:8px;">📅</div>
+            <p style="font-size:15px;font-weight:600;margin-bottom:4px;">No transactions found for the selected date range.</p>
+            <small class="muted">Try adjusting your date filters or click "Clear Filter" to view all records.</small>
+          </div>
+        `}
       </div>
     </div>
   `;
@@ -844,39 +1075,376 @@ function settings() {
   `;
 }
 
-function operators() {
+function usersPage() {
+  const isOwner = me.role === 'owner' || me.role === 'boss';
   return `
     <div class="grid two">
       <div class="panel">
-        <h3>Create Operator Account</h3>
-        <p class="muted">Create individual credentials for warehouse staff.</p>
+        <h3>${isOwner ? 'Create User Account' : 'Create Operator Account'}</h3>
+        <p class="muted">${isOwner ? 'Create an authorized Admin or Operator account directly.' : 'Create an authorized Operator account for warehouse staff.'}</p>
         <div class="form">
-          <label>Display Name</label>
-          <input id="opName" placeholder="Operator full name">
-          <label>User ID</label>
+          ${isOwner ? `
+            <label for="newRoleSelect">Account Role</label>
+            <select id="newRoleSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+              <option value="operator">Operator (Floor movements)</option>
+              <option value="admin">Admin (Warehouse management)</option>
+            </select>
+          ` : ''}
+          <label for="opName">Display Name *</label>
+          <input id="opName" placeholder="Full name">
+          <label for="opId">User ID *</label>
           <input id="opId" placeholder="Unique user ID">
-          <label>Temporary Password (8+ characters)</label>
-          <input id="opPass" type="password" placeholder="Set a password">
+          <label for="opEmail">Email Address</label>
+          <input id="opEmail" type="email" placeholder="user@warehouse.com">
+          <label for="opPhone">Mobile Phone</label>
+          <input id="opPhone" type="tel" placeholder="+919876543210">
+          <label for="opPass">Temporary Password (8+ characters) *</label>
+          <input id="opPass" type="password" placeholder="Min. 8 characters">
         </div>
-        <div class="actions">
-          <button class="primary" id="createOp">Create Operator</button>
+        <div class="actions" style="margin-top:16px;">
+          <button class="primary" id="createOp">Create Account</button>
         </div>
       </div>
+
       <div class="panel">
-        <h3>Operator Accounts</h3>
-        <div class="muted">Active operators with warehouse floor permissions.</div>
-        <div style="margin-top:14px">
+        <h3>${isOwner ? 'Warehouse Accounts' : 'Operator Accounts'}</h3>
+        <div class="muted">${isOwner ? 'All registered warehouse accounts.' : 'Active warehouse operators.'}</div>
+        <div style="margin-top:14px; max-height: 550px; overflow: auto;">
           ${users.map(u => `
             <div class="list-row">
               <div>
-                <b>${esc(u.display_name)}</b>
-                <div class="muted">${esc(u.user_id)} · ${u.active ? 'Active' : 'Disabled'}</div>
+                <b>${esc(u.displayName || u.display_name)}</b>
+                <span class="badge ${u.role === 'owner' || u.role === 'boss' ? 'cyan' : u.role === 'admin' ? 'orange' : 'green'}" style="margin-left:6px;">${roleLabels[u.role] || u.role}</span>
+                <div class="muted">${esc(u.userId || u.user_id)} · ${u.active ? 'Active' : 'Disabled'} ${u.email ? '· ' + esc(u.email) : ''}</div>
               </div>
-              <button class="ghost toggleUser" data-id="${u.id}" data-active="${u.active ? 0 : 1}">
-                ${u.active ? 'Disable' : 'Enable'}
-              </button>
+              <div>
+                ${(u.userId !== 'testboss' && u.role !== 'owner') ? `
+                  <button class="ghost toggleUser" data-id="${u.id}" data-active="${u.active ? 0 : 1}">
+                    ${u.active ? 'Disable' : 'Enable'}
+                  </button>
+                ` : '<span class="badge green">Protected</span>'}
+              </div>
             </div>
-          `).join('') || '<div class="empty">No operator accounts created yet.</div>'}
+          `).join('') || '<div class="empty">No accounts found.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function approvalsPage() {
+  const isOwner = me.role === 'owner' || me.role === 'boss';
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Registration Approval Queues</b>
+        <div class="muted">${isOwner ? 'Review and authorize pending Admin and Operator access requests.' : 'Review and authorize pending Operator floor requests.'}</div>
+      </div>
+      <button class="primary" id="refreshApprovals">↻ Refresh Queues</button>
+    </div>
+
+    ${isOwner ? `
+      <div class="panel" style="margin-bottom:20px;">
+        <div class="panel-head">
+          <div>
+            <h3>Pending Administrator Requests (${pendingAdminsList.length})</h3>
+            <span class="muted">Owner / Super Admin review required for warehouse manager privileges.</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>User ID</th>
+                <th>Full Name</th>
+                <th>Email</th>
+                <th>Phone</th>
+                <th>Organization</th>
+                <th>Reason</th>
+                <th>Requested At</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${pendingAdminsList.length ? pendingAdminsList.map(r => `
+                <tr>
+                  <td><b>${esc(r.user_id)}</b></td>
+                  <td>${esc(r.display_name)}</td>
+                  <td>${esc(r.email || '—')}</td>
+                  <td>${esc(r.phone || '—')}</td>
+                  <td>${esc(r.organization || '—')}</td>
+                  <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">${esc(r.registration_reason || '—')}</td>
+                  <td><small class="muted">${r.requested_at || ''}</small></td>
+                  <td>
+                    <button class="primary approveAdminBtn" data-id="${r.id}" data-user="${esc(r.user_id)}">Approve</button>
+                    <button class="danger rejectAdminBtn" data-id="${r.id}" data-user="${esc(r.user_id)}">Reject</button>
+                  </td>
+                </tr>
+              `).join('') : '<tr><td colspan="8" class="empty">No pending administrator requests.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    ` : ''}
+
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>Pending Operator Requests (${pendingOpsList.length})</h3>
+          <span class="muted">Review and activate floor worker registration applications.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>User ID</th>
+              <th>Display Name</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Employee ID</th>
+              <th>Reason</th>
+              <th>Requested At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${pendingOpsList.length ? pendingOpsList.map(r => `
+              <tr>
+                <td><b>${esc(r.user_id)}</b></td>
+                <td>${esc(r.display_name)}</td>
+                <td>${esc(r.email || '—')}</td>
+                <td>${esc(r.phone || '—')}</td>
+                <td>${esc(r.employee_id || '—')}</td>
+                <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">${esc(r.registration_reason || '—')}</td>
+                <td><small class="muted">${r.requested_at || ''}</small></td>
+                <td>
+                  <button class="primary approveOpBtn" data-id="${r.id}" data-user="${esc(r.user_id)}">Approve</button>
+                  <button class="danger rejectOpBtn" data-id="${r.id}" data-user="${esc(r.user_id)}">Reject</button>
+                </td>
+              </tr>
+            `).join('') : '<tr><td colspan="8" class="empty">No pending operator requests.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function adminMgmtPage() {
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Administrator Management</b>
+        <div class="muted">Authorized warehouse managers. Only the Owner / Super Admin can manage administrative access.</div>
+      </div>
+      <button class="primary" id="refreshAdmins">↻ Refresh List</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>Approved Administrators (${approvedAdminsList.length})</h3>
+          <span class="muted">Active warehouse supervisors and managers.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>User ID</th>
+              <th>Full Name</th>
+              <th>Work Email</th>
+              <th>Department</th>
+              <th>Account Status</th>
+              <th>Approved Date</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${approvedAdminsList.length ? approvedAdminsList.map(a => `
+              <tr>
+                <td><b>${esc(a.userId)}</b></td>
+                <td>${esc(a.displayName)}</td>
+                <td>${esc(a.email || '—')}</td>
+                <td>${esc(a.organization || '—')}</td>
+                <td>
+                  <span class="badge ${a.active ? 'green' : 'red'}">${a.active ? 'Active' : 'Deactivated'}</span>
+                </td>
+                <td><small class="muted">${a.reviewedAt || a.createdAt || '—'}</small></td>
+                <td>
+                  <button class="ghost viewAdminBtn" data-user='${JSON.stringify(a).replace(/'/g, "&apos;")}'>View Details</button>
+                  ${a.active ? `
+                    <button class="danger deactAdminBtn" data-id="${a.id}" data-name="${esc(a.displayName)}" data-user="${esc(a.userId)}">Deactivate Access</button>
+                  ` : `
+                    <button class="primary actAdminBtn" data-id="${a.id}" data-name="${esc(a.displayName)}" data-user="${esc(a.userId)}">Activate Access</button>
+                  `}
+                </td>
+              </tr>
+            `).join('') : '<tr><td colspan="7" class="empty">No approved administrators found. Approve applications in the Approval Queue.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function operatorMgmtPage() {
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Operator Management</b>
+        <div class="muted">Authorized warehouse floor workers permitted to execute Store and Retrieve movements.</div>
+      </div>
+      <button class="primary" id="refreshOperators">↻ Refresh List</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>Approved Floor Operators (${approvedOpsList.length})</h3>
+          <span class="muted">Active warehouse picking & storage operators.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>User ID</th>
+              <th>Full Name</th>
+              <th>Employee ID</th>
+              <th>Account Status</th>
+              <th>Approved Date</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${approvedOpsList.length ? approvedOpsList.map(o => `
+              <tr>
+                <td><b>${esc(o.userId)}</b></td>
+                <td>${esc(o.displayName)}</td>
+                <td>${esc(o.employeeId || '—')}</td>
+                <td>
+                  <span class="badge ${o.active ? 'green' : 'red'}">${o.active ? 'Active' : 'Deactivated'}</span>
+                </td>
+                <td><small class="muted">${o.reviewedAt || o.createdAt || '—'}</small></td>
+                <td>
+                  <button class="ghost viewOpBtn" data-user='${JSON.stringify(o).replace(/'/g, "&apos;")}'>View Details</button>
+                  ${o.active ? `
+                    <button class="danger deactOpBtn" data-id="${o.id}" data-name="${esc(o.displayName)}" data-user="${esc(o.userId)}">Deactivate Access</button>
+                  ` : `
+                    <button class="primary actOpBtn" data-id="${o.id}" data-name="${esc(o.displayName)}" data-user="${esc(o.userId)}">Activate Access</button>
+                  `}
+                </td>
+              </tr>
+            `).join('') : '<tr><td colspan="6" class="empty">No approved operators found. Approve applications in Operator Approvals.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function storePage() {
+  const availableSlots = slots.filter(s => Number(s.quantity || 0) < Number(s.capacity || 10));
+  return `
+    <div class="grid two">
+      <div class="panel">
+        <h3>📥 Store Stock (Operator Movement)</h3>
+        <p class="muted">Select a rack slot and specify quantity to store items safely into warehouse storage.</p>
+        <div class="form">
+          <label for="storeSlotSelect">Select Target Slot *</label>
+          <select id="storeSlotSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+            ${availableSlots.map(s => {
+              const free = Number(s.capacity || 10) - Number(s.quantity || 0);
+              return `<option value="${s.slot}">${s.slot} — ${esc(s.item_name)} (${s.quantity}/${s.capacity} in stock, ${free} space free)</option>`;
+            }).join('') || '<option value="">No available slots with free capacity</option>'}
+          </select>
+
+          <label for="storeQtyInput" style="margin-top:12px;">Quantity to Store *</label>
+          <input id="storeQtyInput" type="number" min="1" max="50" value="1">
+
+          <div class="actions" style="margin-top:16px;">
+            <button class="primary wide" id="execStoreBtn">Execute Store Movement →</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Recent Movements</h3>
+        <span class="muted">My movement activity</span>
+        ${activity(10)}
+      </div>
+    </div>
+  `;
+}
+
+function retrievePage() {
+  const stockSlots = slots.filter(s => Number(s.quantity || 0) > 0);
+  return `
+    <div class="grid two">
+      <div class="panel">
+        <h3>📤 Retrieve Stock (Operator Movement)</h3>
+        <p class="muted">Select a rack slot and specify quantity to pick and retrieve items from warehouse storage.</p>
+        <div class="form">
+          <label for="retSlotSelect">Select Stock Slot *</label>
+          <select id="retSlotSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+            ${stockSlots.map(s => `
+              <option value="${s.slot}">${s.slot} — ${esc(s.item_name)} (${s.quantity} unit(s) available)</option>
+            `).join('') || '<option value="">No slots with available stock</option>'}
+          </select>
+
+          <label for="retQtyInput" style="margin-top:12px;">Quantity to Retrieve *</label>
+          <input id="retQtyInput" type="number" min="1" max="50" value="1">
+
+          <div class="actions" style="margin-top:16px;">
+            <button class="primary wide" id="execRetBtn">Execute Retrieve Movement →</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Recent Movements</h3>
+        <span class="muted">My movement activity</span>
+        ${activity(10)}
+      </div>
+    </div>
+  `;
+}
+
+function profilePage() {
+  return `
+    <div class="panel" style="max-width:650px; margin: 0 auto;">
+      <div class="panel-head">
+        <div>
+          <h3>👤 My Profile & Contact Verification</h3>
+          <span class="muted">Manage your personal details and contact verification for account recovery.</span>
+        </div>
+      </div>
+      <div class="form">
+        <label>User ID</label>
+        <input type="text" readonly value="${esc(me?.userId || '')}">
+
+        <label style="margin-top:10px;">Role</label>
+        <div>
+          <span class="badge ${me?.role === 'owner' || me?.role === 'boss' ? 'cyan' : me?.role === 'admin' ? 'orange' : 'green'}">${roleLabels[me?.role] || me?.role}</span>
+        </div>
+
+        <label style="margin-top:10px;">Display Name</label>
+        <input id="profileNameInput" type="text" value="${esc(me?.displayName || '')}">
+
+        <label style="margin-top:10px;">Registered Email Address</label>
+        <div style="display:flex;gap:8px;">
+          <input id="profileEmailInput" type="email" placeholder="e.g. you@company.com" value="${esc(me?.email || '')}">
+          <span class="badge ${me?.emailVerified || me?.email_verified ? 'green' : 'orange'}" style="align-self:center;">${me?.emailVerified || me?.email_verified ? '✓ Verified' : 'Unverified'}</span>
+        </div>
+
+        <label style="margin-top:10px;">Registered Mobile Number</label>
+        <div style="display:flex;gap:8px;">
+          <input id="profilePhoneInput" type="tel" placeholder="e.g. +919876543210" value="${esc(me?.phone || '')}">
+          <span class="badge ${me?.phoneVerified || me?.phone_verified ? 'green' : 'orange'}" style="align-self:center;">${me?.phoneVerified || me?.phone_verified ? '✓ Verified' : 'Unverified'}</span>
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="primary" id="saveProfileBtn">Save Profile & Contacts</button>
         </div>
       </div>
     </div>
@@ -890,7 +1458,14 @@ function render() {
     page === 'inventory' ? inventory() :
     page === 'rack' ? rackPage() :
     page === 'history' ? historyPage() :
-    page === 'operators' ? operators() :
+    page === 'users' ? usersPage() :
+    page === 'operators' ? usersPage() :
+    page === 'admin_mgmt' ? adminMgmtPage() :
+    page === 'operator_mgmt' ? operatorMgmtPage() :
+    page === 'approvals' ? approvalsPage() :
+    page === 'store' ? storePage() :
+    page === 'retrieve' ? retrievePage() :
+    page === 'profile' ? profilePage() :
     page === 'reports' ? reports() :
     settings();
   wire();
@@ -898,6 +1473,135 @@ function render() {
 
 function wire() {
   $('refresh')?.addEventListener('click', load);
+  $('refreshApprovals')?.addEventListener('click', load);
+  $('refreshAdmins')?.addEventListener('click', load);
+  $('refreshOperators')?.addEventListener('click', load);
+
+  // Date filters & Excel export
+  $('txApplyFilter')?.addEventListener('click', () => {
+    txFromFilter = $('txFromDate')?.value || '';
+    txToFilter = $('txToDate')?.value || '';
+    if (txFromFilter && txToFilter && txFromFilter > txToFilter) {
+      return toast('From Date cannot be later than To Date', true);
+    }
+    load();
+  });
+
+  $('txClearFilter')?.addEventListener('click', () => {
+    txFromFilter = '';
+    txToFilter = '';
+    load();
+  });
+
+  $('txExportExcel')?.addEventListener('click', async () => {
+    try {
+      const from = $('txFromDate')?.value || '';
+      const to = $('txToDate')?.value || '';
+      if (from && to && from > to) {
+        return toast('From Date cannot be later than To Date', true);
+      }
+      let url = `${BACKEND}/transactions/export`;
+      const params = [];
+      if (from) params.push(`from=${encodeURIComponent(from)}`);
+      if (to) params.push(`to=${encodeURIComponent(to)}`);
+      if (params.length) url += '?' + params.join('&');
+
+      toast('Generating Excel export...');
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Export failed' }));
+        throw new Error(err.error || 'Export failed');
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get('Content-Disposition');
+      let filename = 'ASRS_Transactions.xlsx';
+      if (disposition && disposition.includes('filename=')) {
+        const m = disposition.match(/filename="?([^";]+)"?/);
+        if (m && m[1]) filename = m[1];
+      }
+      const blobUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(blobUrl);
+      toast(`Excel export downloaded: ${filename}`);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  // Admin details & deactivation/activation
+  document.querySelectorAll('.viewAdminBtn').forEach(b => b.onclick = () => {
+    const u = JSON.parse(b.dataset.user || '{}');
+    alert(`Administrator Details:\n\nUser ID: ${u.userId}\nFull Name: ${u.displayName}\nWork Email: ${u.email || 'None'}\nPhone: ${u.phone || 'None'}\nDepartment: ${u.organization || 'None'}\nEmployee ID: ${u.employeeId || 'None'}\nReason: ${u.registrationReason || 'None'}\nStatus: ${u.active ? 'Active' : 'Deactivated'}\nRequested At: ${u.requestedAt || 'N/A'}\nApproved At: ${u.reviewedAt || 'N/A'}\nApproved By: ${u.reviewedBy || 'N/A'}`);
+  });
+
+  document.querySelectorAll('.deactAdminBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Are you sure you want to deactivate Administrator "${name}" (${user})?\n\nAll of their active sessions will be revoked immediately and they will be prevented from logging in.`)) return;
+    try {
+      const res = await api(`/api/owner/admins/${id}/deactivate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.actAdminBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Reactivate Administrator "${name}" (${user})?`)) return;
+    try {
+      const res = await api(`/api/owner/admins/${id}/activate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  // Operator details & deactivation/activation
+  document.querySelectorAll('.viewOpBtn').forEach(b => b.onclick = () => {
+    const u = JSON.parse(b.dataset.user || '{}');
+    alert(`Operator Details:\n\nUser ID: ${u.userId}\nFull Name: ${u.displayName}\nEmployee ID: ${u.employeeId || 'None'}\nEmail: ${u.email || 'None'}\nPhone: ${u.phone || 'None'}\nReason: ${u.registrationReason || 'None'}\nStatus: ${u.active ? 'Active' : 'Deactivated'}\nRequested At: ${u.requestedAt || 'N/A'}\nApproved At: ${u.reviewedAt || 'N/A'}\nApproved By: ${u.reviewedBy || 'N/A'}`);
+  });
+
+  document.querySelectorAll('.deactOpBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Are you sure you want to deactivate Operator "${name}" (${user})?\n\nAll of their active sessions will be revoked immediately and they will be blocked from warehouse operations.`)) return;
+    try {
+      const res = await api(`/api/admin/operators/${id}/deactivate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.actOpBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Reactivate Operator "${name}" (${user})?`)) return;
+    try {
+      const res = await api(`/api/admin/operators/${id}/activate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 
   // Search filters
   $('invSearchInput')?.addEventListener('input', e => {
@@ -915,8 +1619,108 @@ function wire() {
   });
 
   // Slot clicks & actions
-  document.querySelectorAll('.slot').forEach(x => x.onclick = () => openMove(x.dataset.slot));
+  document.querySelectorAll('.slot').forEach(x => x.onclick = () => {
+    if (me.role === 'operator') {
+      openMove(x.dataset.slot);
+    } else {
+      toast(`Slot ${x.dataset.slot} selected. Stock movements are reserved for Operators.`);
+    }
+  });
   document.querySelectorAll('.action').forEach(b => b.onclick = () => openMove(b.dataset.slot, b.dataset.action));
+
+  // Operator direct movement page buttons
+  $('execStoreBtn')?.addEventListener('click', async () => {
+    const slot = $('storeSlotSelect')?.value;
+    const qty = Number($('storeQtyInput')?.value || 1);
+    if (!slot) return toast('Please select a valid slot', true);
+    try {
+      await api('/store', {
+        method: 'POST',
+        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard' })
+      });
+      toast(`Successfully stored ${qty} unit(s) into slot ${slot}`);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  $('execRetBtn')?.addEventListener('click', async () => {
+    const slot = $('retSlotSelect')?.value;
+    const qty = Number($('retQtyInput')?.value || 1);
+    if (!slot) return toast('Please select a valid slot', true);
+    try {
+      await api('/retrieve', {
+        method: 'POST',
+        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard' })
+      });
+      toast(`Successfully retrieved ${qty} unit(s) from slot ${slot}`);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  // Approval queue action buttons
+  document.querySelectorAll('.approveAdminBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    if (!confirm(`Approve Administrator request for '${user}'?`)) return;
+    try {
+      const res = await api(`/api/owner/admins/${id}/approve`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.rejectAdminBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    const reason = prompt(`Enter rejection reason for '${user}':`, 'Request rejected by Owner');
+    if (reason === null) return;
+    try {
+      const res = await api(`/api/owner/admins/${id}/reject`, {
+        method: 'POST',
+        body: JSON.stringify({ rejectionReason: reason })
+      });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.approveOpBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    if (!confirm(`Approve Operator request for '${user}'?`)) return;
+    try {
+      const res = await api(`/api/admin/operators/${id}/approve`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.rejectOpBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    const reason = prompt(`Enter rejection reason for '${user}':`, 'Request rejected by Administrator');
+    if (reason === null) return;
+    try {
+      const res = await api(`/api/admin/operators/${id}/reject`, {
+        method: 'POST',
+        body: JSON.stringify({ rejectionReason: reason })
+      });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 
   // Save product details
   document.querySelectorAll('.saveProduct').forEach(b => b.onclick = async () => {
@@ -1010,26 +1814,33 @@ function wire() {
       me = res.user;
       sessionStorage.setItem('asrsUser', JSON.stringify(me));
       $('userName').textContent = me.displayName;
-      toast('Administrator profile & recovery contacts saved successfully');
+      toast('Profile & recovery contacts saved successfully');
       render();
     } catch (e) {
       toast(e.message, true);
     }
   });
 
-  // Create operator
+  // Create user
   $('createOp')?.addEventListener('click', async () => {
     try {
+      const isOwner = me.role === 'owner' || me.role === 'boss';
+      const role = isOwner ? ($('newRoleSelect')?.value || 'operator') : 'operator';
       await api('/users', {
         method: 'POST',
         body: JSON.stringify({
           displayName: $('opName').value.trim(),
           userId: $('opId').value.trim(),
-          password: $('opPass').value
+          password: $('opPass').value,
+          email: $('opEmail')?.value?.trim(),
+          phone: $('opPhone')?.value?.trim(),
+          role
         })
       });
-      toast('Operator account created');
+      toast(`${role === 'admin' ? 'Admin' : 'Operator'} account created`);
       $('opName').value = $('opId').value = $('opPass').value = '';
+      if ($('opEmail')) $('opEmail').value = '';
+      if ($('opPhone')) $('opPhone').value = '';
       users = await api('/users');
       render();
     } catch (e) {
@@ -1037,7 +1848,7 @@ function wire() {
     }
   });
 
-  // Toggle operator active status
+  // Toggle user active status
   document.querySelectorAll('.toggleUser').forEach(b => b.onclick = async () => {
     try {
       await api('/users/' + b.dataset.id, {
@@ -1046,7 +1857,7 @@ function wire() {
       });
       users = await api('/users');
       render();
-      toast('Operator account updated');
+      toast('User account status updated');
     } catch (e) {
       toast(e.message, true);
     }
@@ -1054,6 +1865,10 @@ function wire() {
 }
 
 function openMove(code, action = 'store') {
+  if (me.role !== 'operator') {
+    toast(`Movement operations are restricted to approved Operators. You are signed in as ${me.displayName} (${roleLabels[me.role] || me.role}).`, true);
+    return;
+  }
   let s = slots.find(x => x.slot === code);
   if (!s) return;
   let bg = document.createElement('div');
@@ -1094,7 +1909,7 @@ function openMove(code, action = 'store') {
           slot: code,
           item: s.item,
           quantity: Number(bg.querySelector('#moveQty').value),
-          source: 'dashboard'
+          source: 'dashboard_operator_simulated'
         })
       });
       bg.remove();

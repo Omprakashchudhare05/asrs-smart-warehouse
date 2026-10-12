@@ -102,8 +102,65 @@
       </div>
     </div>
     <button id="enterBtn" class="primary wide">Sign in <span>→</span></button>
-    <small id="loginNote">Choose your role and sign in with your assigned account.</small>
+    <small id="loginNote">Sign in with your assigned warehouse account.</small>
     <div id="loginError" class="login-error" aria-live="polite"></div>
+
+    <div id="opRegFields" class="form hidden">
+      <div class="setup-section">OPERATOR ACCESS APPLICATION</div>
+      <p class="form-desc">Submit an application for warehouse floor operator access. An Administrator will review your request.</p>
+      <label for="opRegUser">Desired User ID *</label>
+      <input id="opRegUser" placeholder="Choose a unique User ID">
+      <label for="opRegName">Full Display Name *</label>
+      <input id="opRegName" placeholder="e.g. John Doe">
+      <label for="opRegPass">Password (min. 8 characters) *</label>
+      <div class="password-wrap">
+        <input id="opRegPass" type="password" placeholder="At least 8 characters">
+        <button type="button" class="show-pass" data-target="opRegPass">Show</button>
+      </div>
+      <label for="opRegEmail">Email Address (Optional)</label>
+      <input id="opRegEmail" type="email" placeholder="john@example.com">
+      <label for="opRegPhone">Mobile Number (Optional)</label>
+      <input id="opRegPhone" type="tel" placeholder="+919876543210">
+      <label for="opRegEmpId">Employee ID / Badge #</label>
+      <input id="opRegEmpId" placeholder="e.g. EMP-2026">
+      <label for="opRegReason">Reason / Role Justification</label>
+      <input id="opRegReason" placeholder="e.g. Picking & packing on morning shift">
+      <button type="button" id="opRegSubmitBtn" class="primary wide">Submit Operator Application →</button>
+      <div class="form-sub-row center">
+        <a href="#" class="regBackLink text-link">← Back to Sign in</a>
+      </div>
+    </div>
+
+    <div id="adminRegFields" class="form hidden">
+      <div class="setup-section">ADMINISTRATOR ACCESS APPLICATION</div>
+      <p class="form-desc">Request warehouse manager privileges. Only the Owner / Super Admin can approve new Admin requests.</p>
+      <label for="adminRegUser">Desired Admin User ID *</label>
+      <input id="adminRegUser" placeholder="Choose a unique User ID">
+      <label for="adminRegName">Full Name *</label>
+      <input id="adminRegName" placeholder="e.g. Jane Smith">
+      <label for="adminRegPass">Password (min. 8 characters) *</label>
+      <div class="password-wrap">
+        <input id="adminRegPass" type="password" placeholder="At least 8 characters">
+        <button type="button" class="show-pass" data-target="adminRegPass">Show</button>
+      </div>
+      <label for="adminRegEmail">Official Work Email *</label>
+      <input id="adminRegEmail" type="email" placeholder="jane.smith@company.com">
+      <label for="adminRegPhone">Mobile Number (Optional)</label>
+      <input id="adminRegPhone" type="tel" placeholder="+919876543210">
+      <label for="adminRegOrg">Department / Organization</label>
+      <input id="adminRegOrg" placeholder="e.g. Logistics & Warehouse Operations">
+      <label for="adminRegReason">Business Justification *</label>
+      <input id="adminRegReason" placeholder="e.g. Shift supervisor managing operators & inventory">
+      <button type="button" id="adminRegSubmitBtn" class="primary wide">Submit Admin Application →</button>
+      <div class="form-sub-row center">
+        <a href="#" class="regBackLink text-link">← Back to Sign in</a>
+      </div>
+    </div>
+
+    <div class="login-footer-links" id="loginFooterLinks" style="margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 13px; display: flex; flex-direction: column; gap: 8px;">
+      <div>Need warehouse floor access? <a href="#" id="opRegLink" class="text-link">Apply for Operator Access</a></div>
+      <div>Need warehouse manager access? <a href="#" id="adminRegLink" class="text-link">Apply for Admin Access</a></div>
+    </div>
   </div>
 </div>
 
@@ -123,7 +180,10 @@
   <main class="main">
     <header>
       <div>
-        <span class="eyebrow" id="topWarehouseLabel">SMART WAREHOUSE / OPERATIONS</span>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span class="eyebrow" id="topWarehouseLabel">SMART WAREHOUSE / OPERATIONS</span>
+          <span class="badge" style="background:#e0e7ff;color:#3730a3;font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;border:1px solid #c7d2fe;">SIMULATION MODE (Software Only)</span>
+        </div>
         <h2 id="pageTitle">Dashboard</h2>
       </div>
       <div class="user">

@@ -154,6 +154,17 @@ async function initDb() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified INT DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified INT DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'approved';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS requested_role TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS effective_role TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS registration_reason TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS organization TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_id TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS requested_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_by TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id TEXT;
     `);
   } else {
     sqliteDb.exec(`
@@ -242,6 +253,16 @@ async function initDb() {
     addCol('users', 'phone', 'TEXT DEFAULT NULL');
     addCol('users', 'email_verified', 'INTEGER DEFAULT 0');
     addCol('users', 'phone_verified', 'INTEGER DEFAULT 0');
+    addCol('users', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'");
+    addCol('users', 'requested_role', 'TEXT DEFAULT NULL');
+    addCol('users', 'effective_role', 'TEXT DEFAULT NULL');
+    addCol('users', 'registration_reason', 'TEXT DEFAULT NULL');
+    addCol('users', 'organization', 'TEXT DEFAULT NULL');
+    addCol('users', 'employee_id', 'TEXT DEFAULT NULL');
+    addCol('users', 'requested_at', 'TEXT DEFAULT NULL');
+    addCol('users', 'reviewed_at', 'TEXT DEFAULT NULL');
+    addCol('users', 'reviewed_by', 'TEXT DEFAULT NULL');
+    addCol('users', 'rejection_reason', 'TEXT DEFAULT NULL');
     addCol('slots', 'quantity', 'INTEGER NOT NULL DEFAULT 1');
     addCol('slots', 'capacity', 'INTEGER NOT NULL DEFAULT 10');
     addCol('slots', 'item_name', "TEXT NOT NULL DEFAULT ''");
@@ -253,6 +274,7 @@ async function initDb() {
     addCol('transactions', 'after_quantity', 'INTEGER NOT NULL DEFAULT 0');
     addCol('transactions', 'user_name', "TEXT DEFAULT 'System'");
     addCol('transactions', 'role', "TEXT DEFAULT 'operator'");
+    addCol('transactions', 'user_id', 'TEXT DEFAULT NULL');
   }
 
   // Ensure rack_config default exists

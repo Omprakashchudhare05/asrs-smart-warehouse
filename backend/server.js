@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const path = require('path');
+const ExcelJS = require('exceljs');
 const db = require('./db');
 require('dotenv').config();
 
@@ -24,18 +25,86 @@ function toUtcEpoch(ts) {
 }
 
 const hash = (p, s) => crypto.scryptSync(p, s, 64).toString('hex');
-const safeUser = u => ({
-  id: u.id,
-  userId: u.user_id,
-  displayName: u.display_name,
-  role: u.role,
-  email: u.email || null,
-  phone: u.phone || null,
-  emailVerified: Boolean(u.email_verified),
-  phoneVerified: Boolean(u.phone_verified),
-  email_verified: Number(u.email_verified || 0),
-  phone_verified: Number(u.phone_verified || 0)
-});
+
+function getUserRole(u) {
+  if (!u) return 'anonymous';
+  if (u.user_id === 'testboss' || u.effective_role === 'owner') return 'owner';
+  if (u.effective_role === 'admin' || (u.requested_role === 'admin' && u.role === 'boss')) return 'admin';
+  if (u.effective_role === 'operator' || u.role === 'operator') return 'operator';
+  if (u.role === 'boss') return 'owner';
+  return u.role || 'operator';
+}
+
+function sanitizeExcelCell(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'number') return val;
+  const s = String(val);
+  // Protect against spreadsheet formula injection (leading =, +, -, @, tab, CR)
+  if (/^[=\+\-@\t\r]/.test(s)) {
+    return "'" + s;
+  }
+  return s;
+}
+
+function parseAndValidateDateRange(fromStr, toStr) {
+  let from = null;
+  let to = null;
+  if (fromStr) {
+    const s = String(fromStr).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || isNaN(Date.parse(s))) {
+      throw Error('Invalid From Date format. Expected YYYY-MM-DD');
+    }
+    from = s;
+  }
+  if (toStr) {
+    const s = String(toStr).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || isNaN(Date.parse(s))) {
+      throw Error('Invalid To Date format. Expected YYYY-MM-DD');
+    }
+    to = s;
+  }
+  if (from && to && from > to) {
+    throw Error('From Date cannot be later than To Date');
+  }
+  const startBound = from ? `${from} 00:00:00` : null;
+  let endBound = null;
+  if (to) {
+    const d = new Date(`${to}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    const nextDay = d.toISOString().slice(0, 10);
+    endBound = `${nextDay} 00:00:00`;
+  }
+  return { from, to, startBound, endBound };
+}
+
+const safeUser = u => {
+  const role = getUserRole(u);
+  return {
+    id: u.id,
+    userId: u.user_id,
+    displayName: u.display_name,
+    role,
+    approvalStatus: u.approval_status || 'approved',
+    approval_status: u.approval_status || 'approved',
+    requestedRole: u.requested_role || null,
+    effectiveRole: u.effective_role || role,
+    effective_role: u.effective_role || role,
+    employeeId: u.employee_id || null,
+    organization: u.organization || null,
+    registrationReason: u.registration_reason || null,
+    email: u.email || null,
+    phone: u.phone || null,
+    emailVerified: Boolean(u.email_verified),
+    phoneVerified: Boolean(u.phone_verified),
+    email_verified: Number(u.email_verified || 0),
+    phone_verified: Number(u.phone_verified || 0),
+    active: Number(u.active !== undefined ? u.active : 1),
+    requestedAt: u.requested_at || null,
+    reviewedAt: u.reviewed_at || null,
+    reviewedBy: u.reviewed_by || null,
+    createdAt: u.created_at || null
+  };
+};
 
 // Health check
 app.get('/health', (q, r) => r.json({
@@ -65,6 +134,111 @@ app.get('/auth/status', async (q, r) => {
 // Provider status check
 app.get('/auth/providers', (q, r) => {
   r.json({ ok: true, ...otpService.getProviderStatus() });
+});
+
+// Public Operator Registration Request
+app.post('/auth/register/operator', async (q, r) => {
+  try {
+    const { userId, displayName, password, email, phone, employeeId, registrationReason } = q.body || {};
+    const cleanId = String(userId || '').trim();
+    if (!cleanId || !/^[a-zA-Z0-9_]{3,30}$/.test(cleanId)) {
+      throw Error('User ID must be 3-30 alphanumeric characters or underscores');
+    }
+    if (!password || String(password).length < 8) {
+      throw Error('Password must have at least 8 characters');
+    }
+    if (!displayName || !String(displayName).trim()) {
+      throw Error('Full name / Display name is required');
+    }
+
+    const existing = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
+    if (existing) {
+      return r.status(400).json({ ok: false, error: 'User ID is already taken. Please choose another.' });
+    }
+
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw Error('Invalid email address format');
+    }
+    const cleanPhone = phone ? String(phone).trim() : null;
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    await db.run(`
+      INSERT INTO users (
+        user_id, password_hash, salt, display_name, role, active,
+        email, phone, approval_status, requested_role, effective_role,
+        employee_id, registration_reason, requested_at
+      ) VALUES (?, ?, ?, ?, 'operator', 0, ?, ?, 'pending', 'operator', 'operator', ?, ?, CURRENT_TIMESTAMP)
+    `, [
+      cleanId,
+      hash(password, salt),
+      salt,
+      String(displayName).trim(),
+      cleanEmail,
+      cleanPhone,
+      employeeId ? String(employeeId).trim() : null,
+      registrationReason ? String(registrationReason).trim() : null
+    ]);
+
+    r.json({
+      ok: true,
+      message: 'Operator registration request submitted successfully. Please wait for an administrator to approve your account.'
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Public Admin Access Request
+app.post('/auth/register/admin', async (q, r) => {
+  try {
+    const { userId, displayName, password, email, phone, organization, registrationReason } = q.body || {};
+    const cleanId = String(userId || '').trim();
+    if (!cleanId || !/^[a-zA-Z0-9_]{3,30}$/.test(cleanId)) {
+      throw Error('User ID must be 3-30 alphanumeric characters or underscores');
+    }
+    if (!password || String(password).length < 8) {
+      throw Error('Password must have at least 8 characters');
+    }
+    if (!displayName || !String(displayName).trim()) {
+      throw Error('Full name / Display name is required');
+    }
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw Error('Valid email address is required for Admin registration');
+    }
+
+    const existing = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
+    if (existing) {
+      return r.status(400).json({ ok: false, error: 'User ID is already taken. Please choose another.' });
+    }
+
+    const cleanPhone = phone ? String(phone).trim() : null;
+    const salt = crypto.randomBytes(16).toString('hex');
+    await db.run(`
+      INSERT INTO users (
+        user_id, password_hash, salt, display_name, role, active,
+        email, phone, approval_status, requested_role, effective_role,
+        organization, registration_reason, requested_at
+      ) VALUES (?, ?, ?, ?, 'boss', 0, ?, ?, 'pending', 'admin', 'admin', ?, ?, CURRENT_TIMESTAMP)
+    `, [
+      cleanId,
+      hash(password, salt),
+      salt,
+      String(displayName).trim(),
+      cleanEmail,
+      cleanPhone,
+      organization ? String(organization).trim() : null,
+      registrationReason ? String(registrationReason).trim() : null
+    ]);
+
+    r.json({
+      ok: true,
+      message: 'Admin access request submitted successfully. The Owner / Super Admin will review your application.'
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
 });
 
 // A. First-Time Admin Registration Step 1: Request OTPs
@@ -316,7 +490,7 @@ app.post('/auth/forgot-password/request', async (q, r) => {
 
     const clean = rawIdentifier.toLowerCase();
     const user = await db.get(
-      "SELECT * FROM users WHERE (LOWER(user_id) = ? OR LOWER(email) = ? OR phone = ?) AND role = 'boss' AND active = 1",
+      "SELECT * FROM users WHERE (LOWER(user_id) = ? OR LOWER(email) = ? OR phone = ?) AND active = 1 AND (approval_status = 'approved' OR approval_status IS NULL)",
       [clean, clean, rawIdentifier]
     );
 
@@ -416,11 +590,11 @@ app.post('/auth/forgot-password/reset', async (q, r) => {
 
     const clean = String(identifier).trim().toLowerCase();
     const user = await db.get(
-      "SELECT * FROM users WHERE (LOWER(user_id) = ? OR LOWER(email) = ? OR phone = ?) AND role = 'boss' AND active = 1",
+      "SELECT * FROM users WHERE (LOWER(user_id) = ? OR LOWER(email) = ? OR phone = ?) AND active = 1 AND (approval_status = 'approved' OR approval_status IS NULL)",
       [clean, clean, String(identifier).trim()]
     );
     if (!user) {
-      throw Error('Administrator account not found');
+      throw Error('Account not found or not active');
     }
 
     const otpRec = await db.get(
@@ -680,17 +854,40 @@ app.post('/auth/setup', async (q, r) => {
 app.post('/auth/login', async (q, r) => {
   try {
     const { userId, password } = q.body || {};
-    const u = await db.get('SELECT * FROM users WHERE user_id=? AND active=1', [String(userId || '')]);
+    const cleanId = String(userId || '').trim();
+    const u = await db.get('SELECT * FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
     if (!u || !password || hash(password, u.salt) !== u.password_hash) {
       return r.status(401).json({ ok: false, error: 'Invalid User ID or password' });
     }
+
+    // Account approval and active status verification
+    if (u.approval_status === 'pending') {
+      return r.status(403).json({
+        ok: false,
+        error: 'Your account registration request is pending administrator approval. Please check back later.'
+      });
+    }
+    if (u.approval_status === 'rejected') {
+      return r.status(403).json({
+        ok: false,
+        error: `Your account registration was rejected${u.rejection_reason ? ': ' + u.rejection_reason : '.'}`
+      });
+    }
+    if (Number(u.active) !== 1) {
+      return r.status(403).json({
+        ok: false,
+        error: 'Your account has been deactivated. Please contact an administrator.'
+      });
+    }
+
+    const resolvedRole = getUserRole(u);
     const token = crypto.randomBytes(32).toString('hex');
     // Save session in database for persistent multi-device access
     await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
       token,
       u.user_id,
       u.display_name,
-      u.role
+      resolvedRole
     ]);
     r.json({ ok: true, token, user: safeUser(u) });
   } catch (e) {
@@ -713,25 +910,87 @@ async function authenticateUser(q, r, next) {
   if (!token) {
     return r.status(401).json({ ok: false, error: 'Authentication required. Please log in.' });
   }
-  const session = await db.get('SELECT * FROM user_sessions WHERE token=?', [token]);
+  const session = await db.get(`
+    SELECT s.token, s.user_id, s.display_name, s.role as session_role,
+           u.id as user_db_id, u.active, u.approval_status, u.role as db_role,
+           u.effective_role, u.requested_role, u.display_name as db_display_name
+    FROM user_sessions s
+    JOIN users u ON s.user_id = u.user_id
+    WHERE s.token = ?
+  `, [token]);
+
   if (!session) {
     return r.status(401).json({ ok: false, error: 'Session expired or invalid. Please log in again.' });
   }
+
+  // Active and approval status verification on every request
+  if (Number(session.active) !== 1 || (session.approval_status && session.approval_status !== 'approved')) {
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [session.user_id]);
+    const errorMsg = session.approval_status === 'pending'
+      ? 'Your account is pending administrator approval.'
+      : session.approval_status === 'rejected'
+        ? 'Your account registration was rejected.'
+        : 'Your account has been deactivated. Please contact an administrator.';
+    return r.status(403).json({ ok: false, error: errorMsg });
+  }
+
+  const resolvedRole = getUserRole({
+    user_id: session.user_id,
+    role: session.db_role,
+    effective_role: session.effective_role,
+    requested_role: session.requested_role
+  });
+
   q.user = {
     userId: session.user_id,
-    displayName: session.display_name,
-    role: session.role
+    displayName: session.db_display_name || session.display_name,
+    role: resolvedRole
   };
   next();
 }
 
-// Boss/Admin Only Middleware
-function bossOnly(q, r, next) {
-  if (q.user?.role === 'boss') {
+// Owner Only Middleware
+function ownerOnly(q, r, next) {
+  if (['owner', 'boss'].includes(q.user?.role)) {
     return next();
   }
-  return r.status(403).json({ ok: false, error: 'Boss/Admin permission required' });
+  return r.status(403).json({ ok: false, error: 'Owner / Super Admin permission required' });
 }
+
+// Admin or Owner Middleware (Admin+)
+function adminOnly(q, r, next) {
+  if (['owner', 'boss', 'admin'].includes(q.user?.role)) {
+    return next();
+  }
+  return r.status(403).json({ ok: false, error: 'Admin / Warehouse Manager permission required' });
+}
+
+// Operator Only Middleware (routine Store/Retrieve restricted to Operator)
+function operatorOnly(q, r, next) {
+  if (q.user?.role === 'operator') {
+    return next();
+  }
+  return r.status(403).json({
+    ok: false,
+    error: `Routine store and retrieve operations are restricted to approved Operators only. Your role (${q.user?.role || 'unknown'}) is not permitted to perform inventory movements directly.`
+  });
+}
+
+// Boss/Admin Only Middleware (Legacy alias)
+function bossOnly(q, r, next) {
+  return ownerOnly(q, r, next);
+}
+
+// Current User Profile Endpoint
+app.get('/auth/me', authenticateUser, async (q, r) => {
+  try {
+    const u = await db.get('SELECT * FROM users WHERE user_id = ?', [q.user.userId]);
+    if (!u) return r.status(404).json({ ok: false, error: 'User not found' });
+    r.json({ ok: true, user: safeUser(u) });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // Hardware API Key Authentication Middleware (for ESP32 / Keypad)
 async function hardwareAuth(q, r, next) {
@@ -801,8 +1060,8 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
   await db.run(`
     INSERT INTO transactions (
       action, slot, item, item_name, sku, source, time,
-      quantity, before_quantity, after_quantity, user_name, role
-    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
+      quantity, before_quantity, after_quantity, user_name, role, user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
   `, [
     action,
     updatedSlot.slot,
@@ -814,7 +1073,8 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
     before,
     after,
     user?.displayName || user?.userId || 'System',
-    user?.role || 'operator'
+    user?.role || 'operator',
+    user?.userId || null
   ]);
 
   return updatedSlot;
@@ -854,13 +1114,121 @@ app.get('/slots', async (q, r) => {
   }
 });
 
-// Get recent transactions
+// Get recent transactions with date filtering and role boundary enforcement
 app.get('/transactions', async (q, r) => {
   try {
-    const txs = await db.all('SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role FROM transactions ORDER BY id DESC LIMIT 1000');
+    const { from, to, startBound, endBound } = parseAndValidateDateRange(q.query.from, q.query.to);
+    const conditions = [];
+    const params = [];
+
+    // Operators only view their own transactions
+    if (q.user?.role === 'operator') {
+      conditions.push('user_id = ?');
+      params.push(q.user.userId);
+    }
+
+    // Inclusive date range boundaries
+    if (startBound) {
+      conditions.push('time >= ?');
+      params.push(startBound);
+    }
+    if (endBound) {
+      conditions.push('time < ?');
+      params.push(endBound);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id FROM transactions ${whereClause} ORDER BY id DESC LIMIT 1000`;
+    const txs = await db.all(sql, params);
     r.json(txs);
   } catch (e) {
-    r.status(500).json({ ok: false, error: e.message });
+    const status = e.message.includes('Date') ? 400 : 500;
+    r.status(status).json({ ok: false, error: e.message });
+  }
+});
+
+// Download transactions as Excel (.xlsx) file
+app.get('/transactions/export', async (q, r) => {
+  try {
+    const { from, to, startBound, endBound } = parseAndValidateDateRange(q.query.from, q.query.to);
+    const conditions = [];
+    const params = [];
+
+    if (q.user?.role === 'operator') {
+      conditions.push('user_id = ?');
+      params.push(q.user.userId);
+    }
+    if (startBound) {
+      conditions.push('time >= ?');
+      params.push(startBound);
+    }
+    if (endBound) {
+      conditions.push('time < ?');
+      params.push(endBound);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id FROM transactions ${whereClause} ORDER BY id DESC`;
+    const txs = await db.all(sql, params);
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'ASRS Smart Warehouse';
+    workbook.created = new Date();
+    const sheet = workbook.addWorksheet('Transactions');
+
+    sheet.columns = [
+      { header: 'Transaction ID', key: 'id', width: 16 },
+      { header: 'Date & Time', key: 'time', width: 22 },
+      { header: 'Action', key: 'action', width: 14 },
+      { header: 'Product Name', key: 'item_name', width: 26 },
+      { header: 'SKU', key: 'sku', width: 16 },
+      { header: 'Slot', key: 'slot', width: 10 },
+      { header: 'Quantity', key: 'quantity', width: 12 },
+      { header: 'User / Actor', key: 'user', width: 20 },
+      { header: 'Source', key: 'source', width: 22 }
+    ];
+
+    sheet.getRow(1).font = { bold: true };
+    sheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF1F5F9' }
+    };
+
+    if (txs.length === 0) {
+      sheet.addRow({
+        id: 'No transactions found for the selected date range'
+      });
+    } else {
+      for (const t of txs) {
+        sheet.addRow({
+          id: t.id,
+          time: t.time || '',
+          action: sanitizeExcelCell(t.action),
+          item_name: sanitizeExcelCell(t.item_name || (t.item ? `Item #${t.item}` : 'N/A')),
+          sku: sanitizeExcelCell(t.sku || ''),
+          slot: sanitizeExcelCell(t.slot),
+          quantity: t.quantity !== null && t.quantity !== undefined ? t.quantity : '',
+          user: sanitizeExcelCell(t.user_id || t.user_name || 'System'),
+          source: sanitizeExcelCell(t.source || 'Dashboard')
+        });
+      }
+    }
+
+    let filename;
+    if (from && to) filename = `ASRS_Transactions_${from}_to_${to}.xlsx`;
+    else if (from) filename = `ASRS_Transactions_from_${from}.xlsx`;
+    else if (to) filename = `ASRS_Transactions_to_${to}.xlsx`;
+    else filename = 'ASRS_Transactions_All.xlsx';
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    r.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    r.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    r.setHeader('Content-Length', buffer.length);
+    return r.send(buffer);
+  } catch (e) {
+    const status = e.message.includes('Date') ? 400 : 500;
+    r.status(status).json({ ok: false, error: e.message });
   }
 });
 
@@ -890,29 +1258,29 @@ app.get('/summary', async (q, r) => {
   }
 });
 
-// Web Store & Retrieve
-app.post('/store', async (q, r) => {
+// Web Store & Retrieve (Operator only)
+app.post('/store', operatorOnly, async (q, r) => {
   try {
-    const { slot, item, quantity = 1, source = 'dashboard' } = q.body || {};
-    const updatedSlot = await handleMovement('STORE', slot, item, quantity, source, q.user);
+    const { slot, item, quantity = 1 } = q.body || {};
+    const updatedSlot = await handleMovement('STORE', slot, item, quantity, 'dashboard_operator_simulated', q.user);
     r.json({ ok: true, slot: updatedSlot });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/retrieve', async (q, r) => {
+app.post('/retrieve', operatorOnly, async (q, r) => {
   try {
-    const { slot, item, quantity = 1, source = 'dashboard' } = q.body || {};
-    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, source, q.user);
+    const { slot, item, quantity = 1 } = q.body || {};
+    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, 'dashboard_operator_simulated', q.user);
     r.json({ ok: true, slot: updatedSlot });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Update product name & SKU
-app.put('/slots/:slot/product', async (q, r) => {
+// Update product name & SKU (Admin & Owner)
+app.put('/slots/:slot/product', adminOnly, async (q, r) => {
   try {
     const code = String(q.params.slot).toUpperCase();
     const s = await db.get('SELECT * FROM slots WHERE slot=?', [code]);
@@ -933,8 +1301,8 @@ app.put('/slots/:slot/product', async (q, r) => {
   }
 });
 
-// Update slot capacity (Boss only)
-app.put('/slots/:slot/capacity', bossOnly, async (q, r) => {
+// Update slot capacity (Owner only)
+app.put('/slots/:slot/capacity', ownerOnly, async (q, r) => {
   try {
     const code = String(q.params.slot).toUpperCase();
     const s = await db.get('SELECT * FROM slots WHERE slot=?', [code]);
@@ -961,7 +1329,7 @@ app.get('/rack/config', async (q, r) => {
   }
 });
 
-app.put('/rack/dimensions', bossOnly, async (q, r) => {
+app.put('/rack/dimensions', ownerOnly, async (q, r) => {
   try {
     const newRows = Number(q.body.rows);
     const newCols = Number(q.body.cols);
@@ -1031,8 +1399,8 @@ app.put('/rack/dimensions', bossOnly, async (q, r) => {
   }
 });
 
-// Hardware API Key Management (Boss only)
-app.get('/hardware/key', bossOnly, async (q, r) => {
+// Hardware API Key Management (Owner only)
+app.get('/hardware/key', ownerOnly, async (q, r) => {
   try {
     const keyRow = await db.get("SELECT value FROM system_settings WHERE key='hardware_api_key'");
     r.json({ ok: true, hardwareApiKey: keyRow?.value || '' });
@@ -1041,7 +1409,7 @@ app.get('/hardware/key', bossOnly, async (q, r) => {
   }
 });
 
-app.post('/hardware/key/regenerate', bossOnly, async (q, r) => {
+app.post('/hardware/key/regenerate', ownerOnly, async (q, r) => {
   try {
     const newKey = 'asrs_hw_' + crypto.randomBytes(16).toString('hex');
     await db.run("UPDATE system_settings SET value=? WHERE key='hardware_api_key'", [newKey]);
@@ -1051,52 +1419,364 @@ app.post('/hardware/key/regenerate', bossOnly, async (q, r) => {
   }
 });
 
-// User Management (Boss only)
-app.get('/users', bossOnly, async (q, r) => {
+// ---------------- APPROVAL QUEUE ROUTES ----------------
+// Owner-only Admin Request Approval Queue
+app.get('/api/owner/pending-admins', ownerOnly, async (q, r) => {
   try {
-    const users = await db.all('SELECT id, user_id, display_name, role, active, email, phone, email_verified, phone_verified, created_at FROM users ORDER BY id');
-    r.json(users);
+    const list = await db.all(`
+      SELECT id, user_id, display_name, email, phone, organization, registration_reason, requested_at, approval_status
+      FROM users
+      WHERE requested_role = 'admin' AND approval_status = 'pending'
+      ORDER BY requested_at ASC
+    `);
+    r.json({ ok: true, requests: list });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/users', bossOnly, async (q, r) => {
+app.post('/api/owner/admins/:id/approve', ownerOnly, async (q, r) => {
   try {
-    const { userId, password, displayName } = q.body || {};
+    const id = Number(q.params.id);
+    const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'admin'", [id]);
+    if (!target) return r.status(404).json({ ok: false, error: 'Pending Admin request not found' });
+    if (target.approval_status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Request already marked as ${target.approval_status}` });
+    }
+
+    await db.run(`
+      UPDATE users
+      SET approval_status = 'approved', effective_role = 'admin', active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+      WHERE id = ?
+    `, [q.user.userId, id]);
+
+    r.json({ ok: true, message: `Admin account '${target.user_id}' has been approved and activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/owner/admins/:id/reject', ownerOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const { rejectionReason } = q.body || {};
+    const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'admin'", [id]);
+    if (!target) return r.status(404).json({ ok: false, error: 'Pending Admin request not found' });
+    if (target.approval_status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Request already marked as ${target.approval_status}` });
+    }
+
+    await db.run(`
+      UPDATE users
+      SET approval_status = 'rejected', active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?, rejection_reason = ?
+      WHERE id = ?
+    `, [q.user.userId, String(rejectionReason || 'Request rejected by Owner').trim(), id]);
+
+    // Purge any sessions
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [target.user_id]);
+
+    r.json({ ok: true, message: `Admin request for '${target.user_id}' has been rejected.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Admin/Owner Operator Request Approval Queue
+app.get('/api/admin/pending-operators', adminOnly, async (q, r) => {
+  try {
+    const list = await db.all(`
+      SELECT id, user_id, display_name, email, phone, employee_id, registration_reason, requested_at, approval_status
+      FROM users
+      WHERE requested_role = 'operator' AND approval_status = 'pending'
+      ORDER BY requested_at ASC
+    `);
+    r.json({ ok: true, requests: list });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/operators/:id/approve', adminOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'operator'", [id]);
+    if (!target) return r.status(404).json({ ok: false, error: 'Pending Operator request not found' });
+    if (target.approval_status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Request already marked as ${target.approval_status}` });
+    }
+
+    await db.run(`
+      UPDATE users
+      SET approval_status = 'approved', effective_role = 'operator', active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+      WHERE id = ?
+    `, [q.user.userId, id]);
+
+    r.json({ ok: true, message: `Operator account '${target.user_id}' has been approved and activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/operators/:id/reject', adminOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const { rejectionReason } = q.body || {};
+    const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'operator'", [id]);
+    if (!target) return r.status(404).json({ ok: false, error: 'Pending Operator request not found' });
+    if (target.approval_status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Request already marked as ${target.approval_status}` });
+    }
+
+    await db.run(`
+      UPDATE users
+      SET approval_status = 'rejected', active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?, rejection_reason = ?
+      WHERE id = ?
+    `, [q.user.userId, String(rejectionReason || 'Request rejected by Administrator').trim(), id]);
+
+    // Purge any sessions
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [target.user_id]);
+
+    r.json({ ok: true, message: `Operator request for '${target.user_id}' has been rejected.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Owner Admin Management
+app.get('/api/owner/admins', ownerOnly, async (q, r) => {
+  try {
+    const admins = await db.all(`
+      SELECT id, user_id, display_name, email, phone, organization, employee_id, active,
+             approval_status, requested_at, reviewed_at, reviewed_by, created_at, role, effective_role, requested_role
+      FROM users
+      WHERE (effective_role = 'admin' OR (requested_role = 'admin' AND role = 'boss'))
+        AND approval_status = 'approved'
+      ORDER BY id DESC
+    `);
+    r.json({ ok: true, admins: admins.map(safeUser) });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/owner/admins/:id/deactivate', ownerOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
+    if (!u) return r.status(404).json({ ok: false, error: 'Admin account not found' });
+    const targetRole = getUserRole(u);
+    if (u.user_id === 'testboss' || targetRole === 'owner') {
+      return r.status(400).json({ ok: false, error: 'Cannot deactivate the Owner account' });
+    }
+    if (targetRole !== 'admin') {
+      return r.status(400).json({ ok: false, error: 'Target user is not an administrator' });
+    }
+
+    await db.run('UPDATE users SET active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [u.user_id]);
+    r.json({ ok: true, message: `Admin '${u.user_id}' has been deactivated. All active sessions have been revoked.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/owner/admins/:id/activate', ownerOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
+    if (!u) return r.status(404).json({ ok: false, error: 'Admin account not found' });
+    const targetRole = getUserRole(u);
+    if (targetRole !== 'admin') {
+      return r.status(400).json({ ok: false, error: 'Target user is not an administrator' });
+    }
+
+    await db.run('UPDATE users SET active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    r.json({ ok: true, message: `Admin '${u.user_id}' has been activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Admin Operator Management
+app.get('/api/admin/operators', adminOnly, async (q, r) => {
+  try {
+    const operators = await db.all(`
+      SELECT id, user_id, display_name, email, phone, organization, employee_id, active,
+             approval_status, requested_at, reviewed_at, reviewed_by, created_at, role, effective_role, requested_role
+      FROM users
+      WHERE (role = 'operator' OR effective_role = 'operator')
+        AND approval_status = 'approved'
+      ORDER BY id DESC
+    `);
+    r.json({ ok: true, operators: operators.map(safeUser) });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/operators/:id/deactivate', adminOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
+    if (!u) return r.status(404).json({ ok: false, error: 'Operator account not found' });
+    const targetRole = getUserRole(u);
+    if (targetRole !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
+    }
+
+    await db.run('UPDATE users SET active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [u.user_id]);
+    r.json({ ok: true, message: `Operator '${u.user_id}' has been deactivated. All active sessions have been revoked.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/operators/:id/activate', adminOnly, async (q, r) => {
+  try {
+    const id = Number(q.params.id);
+    const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
+    if (!u) return r.status(404).json({ ok: false, error: 'Operator account not found' });
+    const targetRole = getUserRole(u);
+    if (targetRole !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
+    }
+
+    await db.run('UPDATE users SET active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    r.json({ ok: true, message: `Operator '${u.user_id}' has been activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// User Management (Admin & Owner)
+app.get('/users', adminOnly, async (q, r) => {
+  try {
+    let users;
+    if (['owner', 'boss'].includes(q.user.role)) {
+      users = await db.all('SELECT id, user_id, display_name, role, effective_role, requested_role, active, approval_status, email, phone, employee_id, organization, created_at, requested_at, reviewed_at, reviewed_by FROM users ORDER BY id');
+    } else {
+      // Admins only see operators
+      users = await db.all("SELECT id, user_id, display_name, role, effective_role, requested_role, active, approval_status, email, phone, employee_id, organization, created_at, requested_at, reviewed_at, reviewed_by FROM users WHERE role = 'operator' OR effective_role = 'operator' ORDER BY id");
+    }
+    const safeList = users.map(u => ({
+      ...safeUser(u),
+      reviewedAt: u.reviewed_at,
+      reviewedBy: u.reviewed_by
+    }));
+    r.json(safeList);
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/users', adminOnly, async (q, r) => {
+  try {
+    const { userId, password, displayName, role = 'operator', email, phone, employeeId, organization } = q.body || {};
     if (!userId || !password || password.length < 8 || !displayName) {
       throw Error('User ID, display name and password (8+ characters) are required');
     }
+    const cleanId = String(userId).trim();
+    if (!/^[a-zA-Z0-9_]{3,30}$/.test(cleanId)) {
+      throw Error('User ID must be 3-30 alphanumeric characters or underscores');
+    }
+
+    const targetRole = String(role).toLowerCase();
+    if (targetRole === 'admin' && !['owner', 'boss'].includes(q.user.role)) {
+      return r.status(403).json({ ok: false, error: 'Only Owner can create Admin accounts' });
+    }
+    if (targetRole === 'owner') {
+      return r.status(403).json({ ok: false, error: 'Cannot create additional Owner accounts' });
+    }
+
+    const existing = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
+    if (existing) {
+      return r.status(400).json({ ok: false, error: 'User ID is already in use' });
+    }
+
     const salt = crypto.randomBytes(16).toString('hex');
-    await db.run("INSERT INTO users(user_id, password_hash, salt, display_name, role) VALUES(?, ?, ?, ?, 'operator')", [
-      String(userId).trim(),
+    const dbRole = targetRole === 'admin' ? 'boss' : 'operator';
+    const effectiveRole = targetRole === 'admin' ? 'admin' : 'operator';
+
+    await db.run(`
+      INSERT INTO users (
+        user_id, password_hash, salt, display_name, role, active,
+        approval_status, requested_role, effective_role, email, phone,
+        employee_id, organization, reviewed_at, reviewed_by
+      ) VALUES (?, ?, ?, ?, ?, 1, 'approved', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+    `, [
+      cleanId,
       hash(password, salt),
       salt,
-      String(displayName).trim()
+      String(displayName).trim(),
+      dbRole,
+      effectiveRole,
+      effectiveRole,
+      email ? String(email).trim().toLowerCase() : null,
+      phone ? String(phone).trim() : null,
+      employeeId ? String(employeeId).trim() : null,
+      organization ? String(organization).trim() : null,
+      q.user.userId
     ]);
+
     r.json({ ok: true });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.patch('/users/:id', bossOnly, async (q, r) => {
+app.patch('/users/:id', adminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id=?', [id]);
-    if (!u || u.role === 'boss') throw Error('Operator not found');
-    const { displayName, active, password } = q.body || {};
+    if (!u) return r.status(404).json({ ok: false, error: 'User not found' });
+
+    const targetRole = getUserRole(u);
+
+    // Prevent modifying Owner (testboss)
+    if (targetRole === 'owner' || u.user_id === 'testboss') {
+      return r.status(403).json({ ok: false, error: 'Cannot modify Owner account via this endpoint' });
+    }
+
+    // Admins can ONLY modify operators
+    if (!['owner', 'boss'].includes(q.user.role) && targetRole !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
+    }
+
+    const { displayName, active, password, approvalStatus } = q.body || {};
     if (displayName !== undefined) {
       await db.run('UPDATE users SET display_name=? WHERE id=?', [String(displayName).trim(), id]);
     }
     if (active !== undefined) {
-      await db.run('UPDATE users SET active=? WHERE id=?', [active ? 1 : 0, id]);
+      const activeVal = active ? 1 : 0;
+      if (activeVal === 0 && u.user_id === q.user.userId && ['owner', 'boss'].includes(q.user.role)) {
+        const ownerCount = await db.get("SELECT COUNT(*) as n FROM users WHERE (user_id='testboss' OR role='boss' OR effective_role='owner') AND active=1 AND id != ?", [id]);
+        if (Number(ownerCount?.n || 0) === 0) {
+          return r.status(400).json({ ok: false, error: 'Cannot deactivate the only active Owner account' });
+        }
+      }
+      await db.run('UPDATE users SET active=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [activeVal, q.user.userId, id]);
+      if (activeVal === 0) {
+        // Immediate session revocation on deactivation!
+        await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
+      }
+    }
+    if (approvalStatus !== undefined) {
+      if (['owner', 'boss'].includes(q.user.role) || targetRole === 'operator') {
+        await db.run('UPDATE users SET approval_status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [approvalStatus, q.user.userId, id]);
+        if (approvalStatus !== 'approved') {
+          await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
+        }
+      }
     }
     if (password) {
       if (password.length < 8) throw Error('Password must have at least 8 characters');
       const salt = crypto.randomBytes(16).toString('hex');
       await db.run('UPDATE users SET password_hash=?, salt=? WHERE id=?', [hash(password, salt), salt, id]);
+      // Invalidate sessions on password change
+      await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
     }
+
     r.json({ ok: true });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });

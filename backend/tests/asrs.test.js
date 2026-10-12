@@ -18,6 +18,8 @@ const { app } = require('../server');
 let server;
 let baseUrl;
 let bossToken = '';
+let operatorToken = '';
+let adminToken = '';
 let hardwareApiKey = '';
 
 test.before(async () => {
@@ -96,9 +98,39 @@ test('3. Login with testboss succeeds and returns persistent token', async () =>
     dummyToken,
     u.user_id,
     'Test Boss',
-    'boss'
+    'owner'
   ]);
   bossToken = dummyToken;
+
+  // Setup approved test operator
+  const opSalt = crypto.randomBytes(16).toString('hex');
+  const opPassHash = crypto.scryptSync('OperatorPass123!', opSalt, 64).toString('hex');
+  await db.run(`
+    INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, requested_role, effective_role)
+    VALUES ('test_op', ?, ?, 'Test Operator', 'operator', 1, 'approved', 'operator', 'operator')
+  `, [opPassHash, opSalt]);
+  operatorToken = 'test_op_token_' + crypto.randomBytes(16).toString('hex');
+  await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
+    operatorToken,
+    'test_op',
+    'Test Operator',
+    'operator'
+  ]);
+
+  // Setup approved test admin
+  const admSalt = crypto.randomBytes(16).toString('hex');
+  const admPassHash = crypto.scryptSync('AdminPass123!', admSalt, 64).toString('hex');
+  await db.run(`
+    INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, requested_role, effective_role)
+    VALUES ('test_admin', ?, ?, 'Test Admin', 'boss', 1, 'approved', 'admin', 'admin')
+  `, [admPassHash, admSalt]);
+  adminToken = 'test_admin_token_' + crypto.randomBytes(16).toString('hex');
+  await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
+    adminToken,
+    'test_admin',
+    'Test Admin',
+    'admin'
+  ]);
 
   const summary = await api('/summary');
   assert.equal(summary.status, 200);
@@ -120,23 +152,42 @@ test('4. Slot catalog integrity: all 16 slots have distinct product names and SK
   assert.notEqual(slotA1.item_name, slotA2.item_name);
 });
 
-test('5. Store and Retrieve operations validate inventory boundaries', async () => {
+test('5. Store and Retrieve operations validate inventory boundaries and enforce Operator role restriction', async () => {
   const allSlots = (await api('/slots')).data;
   const sBefore = allSlots.find(s => s.quantity < s.capacity) || allSlots[1];
   const targetSlot = sBefore.slot;
   const initialQty = sBefore.quantity;
 
-  // Store 1 unit
+  // Routine Store/Retrieve attempted by Boss/Owner MUST return 403
+  const bossStore = await api('/store', {
+    method: 'POST',
+    body: JSON.stringify({ slot: targetSlot, quantity: 1, source: 'dashboard' })
+  });
+  assert.equal(bossStore.status, 403);
+  assert.match(bossStore.data.error, /restricted to approved Operators only/i);
+
+  // Routine Store/Retrieve attempted by Admin MUST return 403
+  const adminStore = await api('/store', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ slot: targetSlot, quantity: 1, source: 'dashboard' })
+  });
+  assert.equal(adminStore.status, 403);
+  assert.match(adminStore.data.error, /restricted to approved Operators only/i);
+
+  // Store 1 unit as approved Operator succeeds
   const storeRes = await api('/store', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
     body: JSON.stringify({ slot: targetSlot, quantity: 1, source: 'dashboard' })
   });
   assert.equal(storeRes.status, 200);
   assert.equal(storeRes.data.slot.quantity, initialQty + 1);
 
-  // Retrieve 1 unit
+  // Retrieve 1 unit as approved Operator succeeds
   const retRes = await api('/retrieve', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
     body: JSON.stringify({ slot: targetSlot, quantity: 1, source: 'dashboard' })
   });
   assert.equal(retRes.status, 200);
@@ -145,6 +196,7 @@ test('5. Store and Retrieve operations validate inventory boundaries', async () 
   // Attempt to retrieve excessive quantity
   const badRet = await api('/retrieve', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
     body: JSON.stringify({ slot: targetSlot, quantity: 9999, source: 'dashboard' })
   });
   assert.equal(badRet.status, 400);
@@ -199,9 +251,10 @@ test('7. Dynamic Rack Configuration: Expand to 5x5 and Safe-Shrink Protection', 
   assert.equal(expand.data.cols, 5);
   assert.equal(expand.data.totalSlots, 25);
 
-  // Add stock to slot E5 (outside 4x4)
+  // Add stock to slot E5 (outside 4x4) via operator
   const storeE5 = await api('/store', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
     body: JSON.stringify({ slot: 'E5', quantity: 3, source: 'dashboard' })
   });
   assert.equal(storeE5.status, 200);
@@ -216,9 +269,10 @@ test('7. Dynamic Rack Configuration: Expand to 5x5 and Safe-Shrink Protection', 
   assert.match(shrinkFail.data.error, /Cannot shrink rack/i);
   assert.match(shrinkFail.data.error, /E5/i);
 
-  // Retrieve stock from E5
+  // Retrieve stock from E5 via operator
   await api('/retrieve', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
     body: JSON.stringify({ slot: 'E5', quantity: 3, source: 'dashboard' })
   });
 
@@ -399,56 +453,65 @@ test('13. First-Time Setup Admin with Email & Phone OTP verification (Simulated 
     if (purpose === 'admin_registration') capturedOtps[type] = otp;
   });
 
-  // Temporarily deactivate boss to simulate first-time warehouse setup
-  await db.run("UPDATE users SET active=0 WHERE user_id='testboss'");
+  // Temporarily deactivate boss accounts to simulate first-time warehouse setup
+  await db.run("UPDATE users SET active=0 WHERE role='boss'");
 
-  // Step 1: Request Registration OTPs
-  const regReq = await api('/auth/setup-admin/request', {
-    method: 'POST',
-    body: JSON.stringify({
-      userId: 'new_warehouse_boss',
-      password: 'StrongBossPassword999!',
-      displayName: 'First Time Boss',
-      email: 'newboss@warehouse.com',
-      phone: '+919876543211',
-      warehouseName: 'Central Logistics Hub',
-      warehouseCode: 'HUB-001',
-      location: 'Pune'
-    })
-  });
-  assert.equal(regReq.status, 200);
-  assert.equal(regReq.data.ok, true);
-  assert.equal(regReq.data.step, 'verify_otp');
-  assert.ok(capturedOtps.email, 'Email OTP generated');
-  assert.ok(capturedOtps.phone, 'Mobile OTP generated');
+  try {
+    // Step 1: Request Registration OTPs
+    const regReq = await api('/auth/setup-admin/request', {
+      method: 'POST',
+      body: JSON.stringify({
+        userId: 'new_warehouse_boss',
+        password: 'StrongBossPassword999!',
+        displayName: 'First Time Boss',
+        email: 'newboss@warehouse.com',
+        phone: '+919876543211',
+        warehouseName: 'Central Logistics Hub',
+        warehouseCode: 'HUB-001',
+        location: 'Pune'
+      })
+    });
+    assert.equal(regReq.status, 200);
+    assert.equal(regReq.data.ok, true);
+    assert.equal(regReq.data.step, 'verify_otp');
+    assert.ok(capturedOtps.email, 'Email OTP generated');
+    assert.ok(capturedOtps.phone, 'Mobile OTP generated');
 
-  // Verify user is staged as INACTIVE (active = 0)
-  const staged = await db.get("SELECT active, email_verified, phone_verified FROM users WHERE user_id='new_warehouse_boss'");
-  assert.equal(staged.active, 0, 'Admin must remain inactive until OTP verification');
+    // Verify user is staged as INACTIVE (active = 0)
+    const staged = await db.get("SELECT active, email_verified, phone_verified FROM users WHERE user_id='new_warehouse_boss'");
+    assert.equal(staged.active, 0, 'Admin must remain inactive until OTP verification');
 
-  // Step 2: Verify with correct OTPs
-  const verifyRes = await api('/auth/setup-admin/verify', {
-    method: 'POST',
-    body: JSON.stringify({
-      userId: 'new_warehouse_boss',
-      emailOtp: capturedOtps.email,
-      phoneOtp: capturedOtps.phone
-    })
-  });
-  assert.equal(verifyRes.status, 200);
-  assert.equal(verifyRes.data.ok, true);
-  assert.ok(verifyRes.data.token, 'Session token issued');
+    // Step 2: Verify with correct OTPs
+    const verifyRes = await api('/auth/setup-admin/verify', {
+      method: 'POST',
+      body: JSON.stringify({
+        userId: 'new_warehouse_boss',
+        emailOtp: capturedOtps.email,
+        phoneOtp: capturedOtps.phone
+      })
+    });
+    assert.equal(verifyRes.status, 200);
+    assert.equal(verifyRes.data.ok, true);
+    assert.ok(verifyRes.data.token, 'Session token issued');
 
-  // Verify user is now ACTIVE (active = 1, email_verified = 1, phone_verified = 1)
-  const activeUser = await db.get("SELECT active, email_verified, phone_verified FROM users WHERE user_id='new_warehouse_boss'");
-  assert.equal(activeUser.active, 1);
-  assert.equal(activeUser.email_verified, 1);
-  assert.equal(activeUser.phone_verified, 1);
-
-  // Clean up simulated user & restore testboss
-  await db.run("DELETE FROM users WHERE user_id='new_warehouse_boss'");
-  await db.run("DELETE FROM otp_verifications WHERE user_id='new_warehouse_boss'");
-  await db.run("UPDATE users SET active=1 WHERE user_id='testboss'");
+    // Verify user is now ACTIVE (active = 1, email_verified = 1, phone_verified = 1)
+    const activeUser = await db.get("SELECT active, email_verified, phone_verified FROM users WHERE user_id='new_warehouse_boss'");
+    assert.equal(activeUser.active, 1);
+    assert.equal(activeUser.email_verified, 1);
+    assert.equal(activeUser.phone_verified, 1);
+  } finally {
+    // Clean up simulated user & restore testboss & test_admin
+    await db.run("DELETE FROM users WHERE user_id='new_warehouse_boss'");
+    await db.run("DELETE FROM otp_verifications WHERE user_id='new_warehouse_boss'");
+    await db.run("UPDATE users SET active=1 WHERE user_id='testboss' OR user_id='test_admin'");
+    // Ensure bossToken session exists
+    const crypto = require('crypto');
+    const existingSession = await db.get("SELECT * FROM user_sessions WHERE token = ?", [bossToken]);
+    if (!existingSession) {
+      bossToken = 'test_token_' + crypto.randomBytes(16).toString('hex');
+      await db.run("INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, 'testboss', 'Test Boss', 'owner')", [bossToken]);
+    }
+  }
 });
 
 test('14. Concurrency Protection: Double-clicks and simultaneous movements prevent negative stock and capacity overflow', async () => {
@@ -459,6 +522,7 @@ test('14. Concurrency Protection: Double-clicks and simultaneous movements preve
   const retrievePromises = Array.from({ length: 5 }, () =>
     api('/retrieve', {
       method: 'POST',
+      headers: { Authorization: `Bearer ${operatorToken}` },
       body: JSON.stringify({ slot: 'A1', quantity: 2, source: 'concurrency_test' })
     })
   );
@@ -480,6 +544,7 @@ test('14. Concurrency Protection: Double-clicks and simultaneous movements preve
   const storePromises = Array.from({ length: 5 }, () =>
     api('/store', {
       method: 'POST',
+      headers: { Authorization: `Bearer ${operatorToken}` },
       body: JSON.stringify({ slot: 'A1', quantity: 4, source: 'concurrency_test' })
     })
   );
@@ -559,5 +624,691 @@ test('15. Admin Profile OTP Verification: Existing admin securely verifies email
   assert.equal(changeRes.status, 200);
   assert.equal(changeRes.data.user.email_verified, 0, 'Editing contact must un-verify until new OTP confirmed');
   assert.equal(changeRes.data.user.phone_verified, 1, 'Unmodified contact retains verified status');
+});
+
+test('16. Operator Role Boundaries: Operator cannot access Admin/Owner endpoints', async () => {
+  // 1. Operator cannot resize rack (Owner only) -> 403
+  const rackRes = await api('/rack/dimensions', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ rows: 4, cols: 4 })
+  });
+  assert.equal(rackRes.status, 403);
+
+  // 2. Operator cannot edit slot capacity (Owner only) -> 403
+  const capRes = await api('/slots/A1/capacity', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ capacity: 20 })
+  });
+  assert.equal(capRes.status, 403);
+
+  // 3. Operator cannot edit product name/SKU (Admin/Owner only) -> 403
+  const prodRes = await api('/slots/A1/product', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ item_name: 'Hacked Product', sku: 'HACK-01' })
+  });
+  assert.equal(prodRes.status, 403);
+
+  // 4. Operator cannot view or manage hardware key (Owner only) -> 403
+  const hwRes = await api('/hardware/key', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(hwRes.status, 403);
+
+  // 5. Operator cannot view user list (Admin/Owner only) -> 403
+  const usersRes = await api('/users', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(usersRes.status, 403);
+
+  // 6. Operator cannot access approval queues -> 403
+  const adminQueueRes = await api('/api/owner/pending-admins', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(adminQueueRes.status, 403);
+
+  const opQueueRes = await api('/api/admin/pending-operators', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opQueueRes.status, 403);
+});
+
+test('17. Admin Role Boundaries: Admin can manage operators and product metadata, but cannot access Owner-only endpoints', async () => {
+  // 1. Admin CAN update product metadata
+  const prodOk = await api('/slots/A2/product', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ item_name: 'Precision Ball Bearings', sku: 'SKU-0002-MOD' })
+  });
+  assert.equal(prodOk.status, 200);
+  assert.equal(prodOk.data.slot.item_name, 'Precision Ball Bearings');
+
+  // 2. Admin CANNOT access Owner-only rack configuration -> 403
+  const rackRes = await api('/rack/dimensions', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ rows: 4, cols: 4 })
+  });
+  assert.equal(rackRes.status, 403);
+
+  // 3. Admin CANNOT update slot capacity -> 403
+  const capRes = await api('/slots/A2/capacity', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ capacity: 50 })
+  });
+  assert.equal(capRes.status, 403);
+
+  // 4. Admin CANNOT manage hardware key -> 403
+  const hwRes = await api('/hardware/key', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(hwRes.status, 403);
+
+  // 5. Admin CANNOT view or approve pending Admins -> 403
+  const pendingAdmins = await api('/api/owner/pending-admins', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(pendingAdmins.status, 403);
+
+  // 6. Admin CAN view pending operators
+  const pendingOps = await api('/api/admin/pending-operators', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(pendingOps.status, 200);
+  assert.equal(pendingOps.data.ok, true);
+});
+
+test('18. Operator Registration & Admin Approval Lifecycle', async () => {
+  // 1. Public Operator registration request
+  const regRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      displayName: 'Bob Operator',
+      email: 'bob@warehouse.com',
+      employeeId: 'EMP-101',
+      registrationReason: 'Night shift picker'
+    })
+  });
+  assert.equal(regRes.status, 200);
+  assert.equal(regRes.data.ok, true);
+
+  // Prevent duplicate registration
+  const dupRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      displayName: 'Bob Operator'
+    })
+  });
+  assert.equal(dupRes.status, 400);
+
+  // 2. Pending operator CANNOT login -> 403
+  const loginPending = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!'
+    })
+  });
+  assert.equal(loginPending.status, 403);
+  assert.match(loginPending.data.error, /pending administrator approval/i);
+
+  // 3. Admin views pending operator queue
+  const queueRes = await api('/api/admin/pending-operators', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(queueRes.status, 200);
+  const targetReq = queueRes.data.requests.find(r => r.user_id === 'new_operator_bob');
+  assert.ok(targetReq, 'Pending operator should appear in queue');
+  assert.equal(targetReq.employee_id, 'EMP-101');
+
+  // 4. Admin approves the operator
+  const approveRes = await api(`/api/admin/operators/${targetReq.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(approveRes.status, 200);
+  assert.equal(approveRes.data.ok, true);
+
+  // 5. Approved operator CAN now login
+  const loginOk = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!'
+    })
+  });
+  assert.equal(loginOk.status, 200);
+  assert.equal(loginOk.data.user.role, 'operator');
+  assert.equal(loginOk.data.user.approvalStatus, 'approved');
+  const bobToken = loginOk.data.token;
+
+  // 6. Approved operator can store/retrieve
+  const bobStore = await api('/store', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'dashboard' })
+  });
+  assert.equal(bobStore.status, 200);
+
+  await api('/retrieve', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'dashboard' })
+  });
+});
+
+test('19. Admin Registration & Owner-Only Approval Lifecycle', async () => {
+  // 1. Public Admin registration request
+  const regRes = await api('/auth/register/admin', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'candidate_admin_alice',
+      password: 'AdminSecurePass789!',
+      displayName: 'Alice Manager',
+      email: 'alice@warehouse.com',
+      phone: '+919876543299',
+      organization: 'Logistics Operations',
+      registrationReason: 'Lead shift supervisor'
+    })
+  });
+  assert.equal(regRes.status, 200);
+  assert.equal(regRes.data.ok, true);
+
+  // 2. Pending admin CANNOT login -> 403
+  const loginPending = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'candidate_admin_alice',
+      password: 'AdminSecurePass789!'
+    })
+  });
+  assert.equal(loginPending.status, 403);
+  assert.match(loginPending.data.error, /pending administrator approval/i);
+
+  // 3. Other Admin CANNOT approve candidate admin -> 403
+  const queueRes = await api('/api/owner/pending-admins', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(queueRes.status, 403);
+
+  // 4. Owner views pending admin queue
+  const ownerQueueRes = await api('/api/owner/pending-admins', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(ownerQueueRes.status, 200);
+  const targetReq = ownerQueueRes.data.requests.find(r => r.user_id === 'candidate_admin_alice');
+  assert.ok(targetReq, 'Pending admin request must exist in owner queue');
+  assert.equal(targetReq.organization, 'Logistics Operations');
+
+  // 5. Admin attempts to approve -> 403
+  const adminAttemptApprove = await api(`/api/owner/admins/${targetReq.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(adminAttemptApprove.status, 403);
+
+  // 6. Owner approves candidate admin
+  const ownerApprove = await api(`/api/owner/admins/${targetReq.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(ownerApprove.status, 200);
+
+  // 7. Approved admin CAN now login with admin role
+  const loginOk = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'candidate_admin_alice',
+      password: 'AdminSecurePass789!'
+    })
+  });
+  assert.equal(loginOk.status, 200);
+  assert.equal(loginOk.data.user.role, 'admin');
+  assert.equal(loginOk.data.user.approvalStatus, 'approved');
+});
+
+test('20. Real-time Session Revocation on Account Deactivation or Rejection', async () => {
+  // Create an approved operator with active session
+  const crypto = require('crypto');
+  const tempToken = 'active_session_token_' + crypto.randomBytes(16).toString('hex');
+  await db.run(`
+    INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, requested_role, effective_role)
+    VALUES ('revocable_user', 'hash', 'salt', 'Revocable User', 'operator', 1, 'approved', 'operator', 'operator')
+  `);
+  await db.run(`
+    INSERT INTO user_sessions (token, user_id, display_name, role)
+    VALUES (?, 'revocable_user', 'Revocable User', 'operator')
+  `, [tempToken]);
+
+  // Session works before deactivation
+  const checkBefore = await api('/slots', {
+    headers: { Authorization: `Bearer ${tempToken}` }
+  });
+  assert.equal(checkBefore.status, 200);
+
+  // Admin deactivates the user via PATCH /users/:id
+  const targetUser = await db.get("SELECT id FROM users WHERE user_id = 'revocable_user'");
+  const deactRes = await api(`/users/${targetUser.id}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify({ active: false })
+  });
+  assert.equal(deactRes.status, 200);
+
+  // Existing session token MUST immediately return 401 or 403 and be purged
+  const checkAfter = await api('/slots', {
+    headers: { Authorization: `Bearer ${tempToken}` }
+  });
+  assert.ok(checkAfter.status === 401 || checkAfter.status === 403, 'Session must be immediately rejected');
+
+  // Verify session removed from database
+  const sessionInDb = await db.get("SELECT * FROM user_sessions WHERE token = ?", [tempToken]);
+  assert.equal(sessionInDb, null, 'Revoked session token must be purged from user_sessions table');
+});
+
+test('21. Transaction Privacy and Server-Derived Attribution', async () => {
+  // 1. Perform movement as test_op (slot A1)
+  const opMove = await api('/store', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({
+      slot: 'A1',
+      quantity: 1,
+      // Attempt to spoof actor and role in body
+      user_name: 'SuperHacker',
+      role: 'owner',
+      user_id: 'testboss'
+    })
+  });
+  assert.equal(opMove.status, 200);
+
+  // 2. Query transactions as Operator: operator must ONLY see transactions matching user_id = test_op
+  const opTxs = await api('/transactions', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opTxs.status, 200);
+  assert.ok(opTxs.data.length >= 1);
+  for (const tx of opTxs.data) {
+    assert.equal(tx.user_id, 'test_op', 'Operator must only see their own transactions');
+  }
+
+  // 3. Verify server-derived attribution in DB: spoofed body fields must be completely ignored
+  const latestTx = await db.get("SELECT * FROM transactions WHERE slot = 'A1' ORDER BY id DESC LIMIT 1");
+  assert.equal(latestTx.user_id, 'test_op', 'Transaction user_id must be derived from server session');
+  assert.equal(latestTx.user_name, 'Test Operator', 'User display name must be derived from session');
+  assert.equal(latestTx.role, 'operator', 'Role must be derived from session');
+
+  // 4. Query transactions as Admin & Owner: receives warehouse-wide transactions
+  const bossTxs = await api('/transactions', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(bossTxs.status, 200);
+  assert.ok(bossTxs.data.length >= opTxs.data.length);
+
+  // Clean up stock in A1
+  await api('/retrieve', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` },
+    body: JSON.stringify({ slot: 'A1', quantity: 1 })
+  });
+});
+
+test('22. Universal Forgot Password works for approved Operators and invalidates sessions', async () => {
+  const otpService = require('../otp-service');
+  let capturedOpOtp = null;
+  otpService.setTestOtpListener(({ otp, purpose }) => {
+    if (purpose === 'forgot_password') capturedOpOtp = otp;
+  });
+
+  // Link email to test_op
+  await db.run("UPDATE users SET email = 'operator@asrs-warehouse.com', email_verified = 1 WHERE user_id = 'test_op'");
+
+  // 1. Request password reset
+  const reqRes = await api('/auth/forgot-password/request', {
+    method: 'POST',
+    body: JSON.stringify({ identifier: 'operator@asrs-warehouse.com' })
+  });
+  assert.equal(reqRes.status, 200);
+  assert.ok(capturedOpOtp, 'OTP dispatched for operator');
+
+  // 2. Reset password
+  const newOpPass = 'NewOperatorPass999!';
+  const resetRes = await api('/auth/forgot-password/reset', {
+    method: 'POST',
+    body: JSON.stringify({
+      identifier: 'test_op',
+      otp: capturedOpOtp,
+      newPassword: newOpPass
+    })
+  });
+  assert.equal(resetRes.status, 200);
+
+  // 3. Prior operator session must be invalidated
+  const oldSessionCheck = await api('/slots', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(oldSessionCheck.status, 401);
+
+  // 4. Login with new password succeeds
+  const loginRes = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: newOpPass })
+  });
+  assert.equal(loginRes.status, 200);
+  assert.equal(loginRes.data.user.role, 'operator');
+  operatorToken = loginRes.data.token;
+});
+
+test('23. Owner Admin Management lifecycle, deactivation, and immediate session invalidation', async () => {
+  // 1. Owner can view approved admins
+  const adminsRes = await api('/api/owner/admins', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(adminsRes.status, 200);
+  assert.ok(Array.isArray(adminsRes.data.admins));
+  const foundAdmin = adminsRes.data.admins.find(a => a.userId === 'test_admin');
+  assert.ok(foundAdmin, 'test_admin must appear in approved admins list');
+  assert.equal(foundAdmin.role, 'admin');
+  assert.equal(foundAdmin.active, 1);
+
+  // 2. Admin or Operator cannot access Owner Admin Management
+  const adminForbidden = await api('/api/owner/admins', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(adminForbidden.status, 403);
+  const opForbidden = await api('/api/owner/admins', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opForbidden.status, 403);
+
+  // 3. Owner deactivates Admin
+  const deactRes = await api(`/api/owner/admins/${foundAdmin.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(deactRes.status, 200);
+  assert.ok(deactRes.data.ok);
+
+  // 4. Admin session is immediately invalidated (purged token returns 401 / deactivated returns 403)
+  const deadSessionRes = await api('/slots', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.ok([401, 403].includes(deadSessionRes.status), 'Deactivated admin request must be rejected');
+
+  // 5. Deactivated admin cannot login
+  const deactLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_admin', password: 'AdminPass123!' })
+  });
+  assert.equal(deactLogin.status, 403, 'Deactivated account cannot sign in');
+
+  // 6. Owner cannot deactivate the last active Owner account (self-lockout prevention)
+  const ownerUser = await db.get("SELECT id FROM users WHERE user_id = 'testboss'");
+  const selfDeact = await api(`/api/owner/admins/${ownerUser.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(selfDeact.status, 400, 'Cannot deactivate the Owner account');
+
+  // 7. Owner reactivates Admin
+  const actRes = await api(`/api/owner/admins/${foundAdmin.id}/activate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(actRes.status, 200);
+
+  // 8. Admin can now sign back in
+  const reactLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_admin', password: 'AdminPass123!' })
+  });
+  assert.equal(reactLogin.status, 200);
+  adminToken = reactLogin.data.token;
+});
+
+test('24. Admin Operator Management lifecycle & Role Boundary Protection', async () => {
+  // 1. Admin can view approved operators
+  const opsRes = await api('/api/admin/operators', {
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(opsRes.status, 200);
+  assert.ok(Array.isArray(opsRes.data.operators));
+  const foundOp = opsRes.data.operators.find(o => o.userId === 'test_op');
+  assert.ok(foundOp, 'test_op must appear in approved operators list');
+  assert.equal(foundOp.role, 'operator');
+  assert.equal(foundOp.active, 1);
+
+  // 2. Operator cannot access Operator Management endpoint
+  const opForbidden = await api('/api/admin/operators', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opForbidden.status, 403);
+
+  // 3. Admin cannot deactivate another Admin or Owner
+  const adminUser = await db.get("SELECT id FROM users WHERE user_id = 'test_admin'");
+  const adminTriesAdmin = await api(`/api/admin/operators/${adminUser.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(adminTriesAdmin.status, 403, 'Admins cannot deactivate Admins');
+
+  const ownerUser = await db.get("SELECT id FROM users WHERE user_id = 'testboss'");
+  const adminTriesOwner = await api(`/api/admin/operators/${ownerUser.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(adminTriesOwner.status, 403, 'Admins cannot deactivate Owner');
+
+  // 4. Admin deactivates Operator
+  const deactRes = await api(`/api/admin/operators/${foundOp.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(deactRes.status, 200);
+
+  // 5. Operator session immediately invalidated (purged token returns 401 / deactivated returns 403)
+  const deadOpSession = await api('/slots', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.ok([401, 403].includes(deadOpSession.status), 'Deactivated operator request must be rejected');
+
+  // 6. Deactivated operator cannot sign in
+  const deactOpLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!' })
+  });
+  assert.equal(deactOpLogin.status, 403);
+
+  // 7. Admin reactivates Operator
+  const actRes = await api(`/api/admin/operators/${foundOp.id}/activate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(actRes.status, 200);
+
+  // 8. Operator can sign back in
+  const reactOpLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!' })
+  });
+  assert.equal(reactOpLogin.status, 200);
+  operatorToken = reactOpLogin.data.token;
+});
+
+test('25. Transaction Date Filtering: inclusive boundaries, error handling, and role privacy', async () => {
+  // 1. Stage specific transactions with known dates
+  await db.run("INSERT INTO transactions (action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id) VALUES ('STORE', 'A1', 1, 'Product A1', 'SKU-A1', 'test', '2026-10-05 10:00:00', 5, 0, 5, 'Test Operator', 'operator', 'test_op')");
+  await db.run("INSERT INTO transactions (action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id) VALUES ('STORE', 'A2', 2, 'Product A2', 'SKU-A2', 'test', '2026-10-10 14:30:00', 3, 0, 3, 'Test Operator', 'operator', 'test_op')");
+  await db.run("INSERT INTO transactions (action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id) VALUES ('STORE', 'A3', 3, 'Product A3', 'SKU-A3', 'test', '2026-10-15 09:15:00', 2, 0, 2, 'Test Operator', 'operator', 'test_op')");
+  // Transaction by another user
+  await db.run("INSERT INTO transactions (action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id) VALUES ('STORE', 'A4', 4, 'Product A4', 'SKU-A4', 'test', '2026-10-10 12:00:00', 1, 0, 1, 'Other Operator', 'operator', 'other_user')");
+
+  // 2. Query range 2026-10-05 to 2026-10-10 as Owner (inclusive boundaries)
+  const rangeRes = await api('/transactions?from=2026-10-05&to=2026-10-10', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(rangeRes.status, 200);
+  const dates = rangeRes.data.map(t => t.time);
+  assert.ok(dates.some(d => d.includes('2026-10-05')), 'Inclusive start boundary: 2026-10-05 must be included');
+  assert.ok(dates.some(d => d.includes('2026-10-10')), 'Inclusive end boundary: 2026-10-10 must be included');
+  assert.ok(!dates.some(d => d.includes('2026-10-15')), 'Records beyond upper boundary must be excluded');
+
+  // 3. Exact single-day range 2026-10-10 to 2026-10-10
+  const singleDayRes = await api('/transactions?from=2026-10-10&to=2026-10-10', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(singleDayRes.status, 200);
+  for (const t of singleDayRes.data) {
+    assert.ok(t.time.includes('2026-10-10'), 'Single-day filter must include only that day');
+  }
+
+  // 4. Role privacy: Operator querying the date range sees ONLY their own records
+  const opFilteredRes = await api('/transactions?from=2026-10-05&to=2026-10-10', {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opFilteredRes.status, 200);
+  for (const t of opFilteredRes.data) {
+    assert.equal(t.user_id, 'test_op', 'Operator must only see their own records even with date filters');
+  }
+  // Other user's transaction must NOT be visible to operator
+  assert.ok(!opFilteredRes.data.some(t => t.user_id === 'other_user'));
+
+  // 5. Invalid date validation
+  const invalidDateRes = await api('/transactions?from=not-a-date', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(invalidDateRes.status, 400);
+
+  // 6. Reversed date range validation (from > to)
+  const reversedRes = await api('/transactions?from=2026-10-15&to=2026-10-05', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(reversedRes.status, 400);
+  assert.equal(reversedRes.data.error, 'From Date cannot be later than To Date');
+});
+
+test('26. Excel (.xlsx) Export: binary verification, formula injection defense, and role scope', async () => {
+  const ExcelJS = require('exceljs');
+
+  // 1. Stage transaction with formula injection attempts
+  await db.run(`
+    INSERT INTO transactions (
+      action, slot, item, item_name, sku, source, time,
+      quantity, before_quantity, after_quantity, user_name, role, user_id
+    ) VALUES (
+      '=cmd|'' /C calc''!A0', 'B1', 99, '+ProductWithFormula', '-SKUFormula', '@FormulaSource',
+      '2026-10-08 11:20:00', 1, 0, 1, '+EvilDisplayName', 'operator', '=EVIL_USER'
+    )
+  `);
+
+  // 2. Fetch Excel export as Owner
+  const exportUrl = `${baseUrl}/transactions/export?from=2026-10-05&to=2026-10-10`;
+  const exportRes = await fetch(exportUrl, {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(exportRes.status, 200);
+  assert.equal(
+    exportRes.headers.get('content-type'),
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  );
+  assert.ok(
+    exportRes.headers.get('content-disposition').includes('filename="ASRS_Transactions_2026-10-05_to_2026-10-10.xlsx"')
+  );
+
+  // 3. Load Excel workbook and verify structure
+  const arrayBuffer = await exportRes.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const ws = wb.getWorksheet('Transactions');
+  assert.ok(ws, 'Worksheet "Transactions" must exist');
+
+  // Verify header row
+  const headerRow = ws.getRow(1);
+  assert.equal(headerRow.getCell(1).value, 'Transaction ID');
+  assert.equal(headerRow.getCell(3).value, 'Action');
+  assert.equal(headerRow.getCell(4).value, 'Product Name');
+
+  // 4. Verify formula injection protection on data rows
+  let foundSanitized = false;
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber > 1) {
+      const actionVal = String(row.getCell(3).value || '');
+      const productVal = String(row.getCell(4).value || '');
+      const userVal = String(row.getCell(8).value || '');
+      if (actionVal.includes('calc') || productVal.includes('ProductWithFormula')) {
+        foundSanitized = true;
+        // MUST be sanitized with leading single-quote (')
+        assert.ok(actionVal.startsWith("'="), `Formula cell must be sanitized with leading quote: ${actionVal}`);
+        assert.ok(productVal.startsWith("'+"), `Formula cell must be sanitized with leading quote: ${productVal}`);
+        assert.ok(userVal.startsWith("'="), `Formula user must be sanitized with leading quote: ${userVal}`);
+      }
+    }
+  });
+  assert.ok(foundSanitized, 'Sanitized formula injection row must be present');
+
+  // 5. Operator export check: Operator cannot export other users' records
+  const opExportRes = await fetch(`${baseUrl}/transactions/export?from=2026-10-05&to=2026-10-10`, {
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(opExportRes.status, 200);
+  const opBuffer = Buffer.from(await opExportRes.arrayBuffer());
+  const opWb = new ExcelJS.Workbook();
+  await opWb.xlsx.load(opBuffer);
+  const opWs = opWb.getWorksheet('Transactions');
+  opWs.eachRow((row, rowNumber) => {
+    if (rowNumber > 1) {
+      const userCell = String(row.getCell(8).value || '');
+      assert.ok(!userCell.includes('other_user'), 'Operator export must never include another user');
+    }
+  });
+
+  // 6. Empty range export check (returns valid workbook without crash)
+  const emptyExportRes = await fetch(`${baseUrl}/transactions/export?from=2099-01-01&to=2099-01-02`, {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(emptyExportRes.status, 200);
+  const emptyWb = new ExcelJS.Workbook();
+  await emptyWb.xlsx.load(Buffer.from(await emptyExportRes.arrayBuffer()));
+  const emptyWs = emptyWb.getWorksheet('Transactions');
+  assert.ok(emptyWs, 'Empty result must still generate a valid Excel sheet');
+  const emptyNoteCell = emptyWs.getRow(2).getCell(1).value;
+  assert.ok(String(emptyNoteCell).includes('No transactions found'), 'Empty state note row must be present');
+});
+
+test('27. Role-Specific Navigation Menu Contracts & Client-Side Privilege Isolation', async () => {
+  // Read dashboard/app.js to verify menu definition contracts
+  const appJs = fs.readFileSync(path.join(__dirname, '../../dashboard/app.js'), 'utf8');
+  assert.ok(appJs.includes("admin_mgmt', '♟', 'Admin Management'"), 'Owner menu must include Admin Management');
+  assert.ok(appJs.includes("operator_mgmt', '♟', 'Operator Management'"), 'Admin menu must include Operator Management');
+  
+  // Verify Admin menu does not include Owner-only options
+  const adminMenuMatch = appJs.match(/admin:\s*\[([\s\S]*?)\],\s*operator:/);
+  assert.ok(adminMenuMatch, 'Admin menu must be defined');
+  const adminMenuStr = adminMenuMatch[1];
+  assert.ok(!adminMenuStr.includes('admin_mgmt'), 'Admin menu must NOT contain Admin Management');
+  assert.ok(!adminMenuStr.includes("'rack'"), 'Admin menu must NOT contain Rack Configuration');
+  assert.ok(!adminMenuStr.includes('settings'), 'Admin menu must NOT contain Settings & Hardware');
+  assert.ok(!adminMenuStr.includes("'store'"), 'Admin menu must NOT contain Store Stock');
+  assert.ok(!adminMenuStr.includes("'retrieve'"), 'Admin menu must NOT contain Retrieve Stock');
+
+  // Verify Operator menu does not include Management options
+  const opMenuMatch = appJs.match(/operator:\s*\[([\s\S]*?)\]\s*\};/);
+  assert.ok(opMenuMatch, 'Operator menu must be defined');
+  const opMenuStr = opMenuMatch[1];
+  assert.ok(!opMenuStr.includes('admin_mgmt'), 'Operator menu must NOT contain Admin Management');
+  assert.ok(!opMenuStr.includes('operator_mgmt'), 'Operator menu must NOT contain Operator Management');
+  assert.ok(!opMenuStr.includes('approvals'), 'Operator menu must NOT contain Approvals');
+  assert.ok(!opMenuStr.includes("'rack'"), 'Operator menu must NOT contain Rack Configuration');
+  assert.ok(!opMenuStr.includes('settings'), 'Operator menu must NOT contain Settings & Hardware');
+  assert.ok(opMenuStr.includes("'store'"), 'Operator menu must contain Store Stock');
+  assert.ok(opMenuStr.includes("'retrieve'"), 'Operator menu must contain Retrieve Stock');
 });
 
