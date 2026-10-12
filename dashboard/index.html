@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#2463eb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="ASRS">
+  <title>AS/RS Smart Warehouse</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login-screen">
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="brand-mark">AS</div>
+      <div><b>AS/RS</b><small>SMART WAREHOUSE</small></div>
+    </div>
+    <div class="login-illustration"><span>▦</span><i></i><i></i><i></i></div>
+    <h1 id="loginTitle">Welcome back</h1>
+    <p id="loginHint">Sign in to your warehouse control center.</p>
+    <div class="role-choice" id="roleChoice">
+      <button type="button" class="role active" data-role="boss">♛ &nbsp; Boss / Admin</button>
+      <button type="button" class="role" data-role="operator">⚙ &nbsp; Operator</button>
+    </div>
+    <div id="setupFields" class="form hidden">
+      <div class="setup-section">FIRST-TIME WAREHOUSE SETUP</div>
+      <label for="warehouseName">Warehouse / Store name</label>
+      <input id="warehouseName" placeholder="e.g. Main Warehouse" autocomplete="organization">
+      <label for="warehouseCode">Warehouse code</label>
+      <input id="warehouseCode" placeholder="e.g. WH-001">
+      <label for="warehouseLocation">Warehouse location</label>
+      <input id="warehouseLocation" placeholder="City / address">
+      <div class="setup-section">CREATE ADMIN ACCOUNT</div>
+      <label for="setupName">Display name</label>
+      <input id="setupName" placeholder="Your name" autocomplete="name">
+      <label for="setupUser">Create User ID</label>
+      <input id="setupUser" placeholder="Choose a User ID" autocomplete="username">
+      <label for="setupEmail">Admin Email (for OTP verification)</label>
+      <input id="setupEmail" type="email" placeholder="admin@company.com" autocomplete="email">
+      <label for="setupPhone">Mobile Number (for SMS OTP)</label>
+      <input id="setupPhone" type="tel" placeholder="+919876543210" autocomplete="tel">
+      <label for="setupPass">Create password</label>
+      <div class="password-wrap">
+        <input id="setupPass" type="password" placeholder="At least 8 characters" autocomplete="new-password">
+        <button type="button" class="show-pass" data-target="setupPass">Show</button>
+      </div>
+    </div>
+    <div id="setupOtpFields" class="form hidden">
+      <div class="setup-section">VERIFY ADMIN IDENTITY (OTP)</div>
+      <p class="form-desc">Verification codes sent to your email and mobile. Valid for 5 minutes.</p>
+      <label for="setupEmailOtp">Email Verification Code</label>
+      <input id="setupEmailOtp" type="text" maxlength="6" placeholder="Enter 6-digit Email OTP" autocomplete="one-time-code">
+      <label for="setupPhoneOtp">Mobile SMS Verification Code</label>
+      <input id="setupPhoneOtp" type="text" maxlength="6" placeholder="Enter 6-digit Mobile OTP" autocomplete="one-time-code">
+      <div class="otp-resend-row">
+        <span id="setupOtpTimer">Expires in 5:00</span>
+        <button type="button" id="setupResendBtn" class="link-btn" disabled>Resend Code</button>
+      </div>
+    </div>
+    <div id="loginFields" class="form">
+      <label for="loginUser">User ID</label>
+      <input id="loginUser" placeholder="Enter your User ID" autocomplete="username">
+      <label for="loginPass">Password</label>
+      <div class="password-wrap">
+        <input id="loginPass" type="password" placeholder="Enter your password" autocomplete="current-password">
+        <button type="button" class="show-pass" data-target="loginPass">Show</button>
+      </div>
+      <div class="form-sub-row">
+        <a href="#" id="forgotPassLink" class="text-link">Forgot Password?</a>
+      </div>
+    </div>
+    <div id="forgotFields" class="form hidden">
+      <div class="setup-section">ADMIN PASSWORD RECOVERY</div>
+      <div id="forgotStep1">
+        <p class="form-desc">Enter your registered User ID, Email address, or Mobile number to receive a recovery code.</p>
+        <label for="forgotIdentifier">User ID / Email / Mobile</label>
+        <input id="forgotIdentifier" placeholder="e.g. testboss or boss@company.com">
+        <button type="button" id="forgotSendBtn" class="primary wide">Send Verification Code →</button>
+      </div>
+      <div id="forgotStep2" class="hidden">
+        <p class="form-desc" id="forgotDestLabel">Verification code sent to your registered contact.</p>
+        <label for="forgotOtp">Enter 6-digit Code</label>
+        <input id="forgotOtp" type="text" maxlength="6" placeholder="6-digit OTP" autocomplete="one-time-code">
+        <label for="forgotNewPass">New Password</label>
+        <div class="password-wrap">
+          <input id="forgotNewPass" type="password" placeholder="At least 8 characters" autocomplete="new-password">
+          <button type="button" class="show-pass" data-target="forgotNewPass">Show</button>
+        </div>
+        <label for="forgotConfirmPass">Confirm New Password</label>
+        <input id="forgotConfirmPass" type="password" placeholder="Re-enter new password">
+        <div class="otp-resend-row">
+          <span id="forgotOtpTimer">Expires in 5:00</span>
+          <button type="button" id="forgotResendBtn" class="link-btn" disabled>Resend Code</button>
+        </div>
+        <button type="button" id="forgotResetBtn" class="primary wide">Reset Password & Invalidate Sessions →</button>
+      </div>
+      <div class="form-sub-row center">
+        <a href="#" id="forgotBackLink" class="text-link">← Back to Sign in</a>
+      </div>
+    </div>
+    <button id="enterBtn" class="primary wide">Sign in <span>→</span></button>
+    <small id="loginNote">Choose your role and sign in with your assigned account.</small>
+    <div id="loginError" class="login-error" aria-live="polite"></div>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">AS</div>
+      <div><b>AS/RS</b><small>CONTROL CENTER</small></div>
+    </div>
+    <div class="nav-caption">WORKSPACE</div>
+    <nav id="nav"></nav>
+    <div class="side-status">
+      <span class="dot"></span>
+      <span><b>System Status</b><small id="dbStatusLabel">Online & Connected</small></span>
+    </div>
+  </aside>
+  <main class="main">
+    <header>
+      <div>
+        <span class="eyebrow" id="topWarehouseLabel">SMART WAREHOUSE / OPERATIONS</span>
+        <h2 id="pageTitle">Dashboard</h2>
+      </div>
+      <div class="user">
+        <div id="avatar">U</div>
+        <div><b id="userName">User</b><small id="userRole">Role</small></div>
+        <button id="logout" title="Log out" aria-label="Log out">↪</button>
+      </div>
+    </header>
+    <section id="content"></section>
+    <footer>AS/RS Portable Control Center <span>•</span> Live Inventory, Dynamic Rack & ESP32 Integration</footer>
+  </main>
+</div>
+
+<div id="toast" aria-live="polite"></div>
+
+<script src="app.js"></script>
+<script>
+  document.querySelectorAll('.show-pass').forEach(b => b.addEventListener('click', () => {
+    const i = document.getElementById(b.dataset.target);
+    i.type = i.type === 'password' ? 'text' : 'password';
+    b.textContent = i.type === 'password' ? 'Show' : 'Hide';
+  }));
+  let chosenRole = 'boss';
+  document.querySelectorAll('.role').forEach(b => b.addEventListener('click', () => {
+    chosenRole = b.dataset.role;
+    document.querySelectorAll('.role').forEach(x => x.classList.toggle('active', x === b));
+  }));
+  window.getChosenRole = () => chosenRole;
+
+  // Register PWA Service Worker
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
