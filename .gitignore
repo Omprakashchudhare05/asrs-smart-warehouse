@@ -16,6 +16,7 @@ backend/asrs.db
 *.test.db
 *.test.db*
 *backup*
+*.dump
 
 # System logs & OS files
 *.log
