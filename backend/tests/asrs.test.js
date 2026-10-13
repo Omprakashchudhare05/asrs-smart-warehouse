@@ -116,6 +116,7 @@ test('3. Login with testboss succeeds and returns persistent token', async () =>
     'Test Operator',
     'operator'
   ]);
+  await db.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', 'test_op', 'operator', 'active')");
 
   // Setup approved test admin
   const admSalt = crypto.randomBytes(16).toString('hex');
@@ -131,6 +132,7 @@ test('3. Login with testboss succeeds and returns persistent token', async () =>
     'Test Admin',
     'admin'
   ]);
+  await db.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', 'test_admin', 'store_admin', 'active')");
 
   const summary = await api('/summary');
   assert.equal(summary.status, 200);
@@ -886,6 +888,7 @@ test('20. Real-time Session Revocation on Account Deactivation or Rejection', as
     INSERT INTO user_sessions (token, user_id, display_name, role)
     VALUES (?, 'revocable_user', 'Revocable User', 'operator')
   `, [tempToken]);
+  await db.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', 'revocable_user', 'operator', 'active')");
 
   // Session works before deactivation
   const checkBefore = await api('/slots', {
@@ -1312,3 +1315,698 @@ test('27. Role-Specific Navigation Menu Contracts & Client-Side Privilege Isolat
   assert.ok(opMenuStr.includes("'retrieve'"), 'Operator menu must contain Retrieve Stock');
 });
 
+test('28. Public Store Application Onboarding: validates input, prevents duplicate codes, and creates pending store', async () => {
+  // Invalid empty name
+  const invalidName = await api('/api/stores/apply', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({ name: '', code: 'STORE1', email: 'owner@store1.com', password: 'Password123!' })
+  });
+  assert.equal(invalidName.status, 400);
+
+  // Valid application for Grocery Store
+  const validApp = await api('/api/stores/apply', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({
+      name: 'Fresh Mart Grocery',
+      code: 'FM_GROCERY_01',
+      storeType: 'grocery',
+      ownerUserId: 'fm_owner',
+      ownerName: 'Fresh Mart Owner',
+      email: 'owner@freshmart.com',
+      phone: '+919876500001',
+      address: '123 Market Road',
+      city: 'Pune',
+      password: 'FreshPassword123!',
+      applicationReason: 'Quick grocery fulfillment dark store'
+    })
+  });
+  assert.equal(validApp.status, 200);
+  assert.equal(validApp.data.ok, true);
+  assert.ok(validApp.data.storeId);
+  assert.equal(validApp.data.code, 'FM_GROCERY_01');
+
+  // Duplicate code attempt must fail
+  const dupCode = await api('/api/stores/apply', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({
+      name: 'Fresh Mart Second Branch',
+      code: 'FM_GROCERY_01',
+      email: 'second@freshmart.com',
+      password: 'Password123!'
+    })
+  });
+  assert.equal(dupCode.status, 400);
+  assert.match(dupCode.data.error, /already registered/i);
+});
+
+test('29. Platform Owner Approval Lifecycle: activates store, activates owner, initializes 16 slots, and registers device', async () => {
+  // Pending stores queue as Platform Owner
+  const pendingRes = await api('/api/platform/pending-stores', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(pendingRes.status, 200);
+  assert.ok(Array.isArray(pendingRes.data.stores));
+  const pendingStore = pendingRes.data.stores.find(s => s.code === 'FM_GROCERY_01');
+  assert.ok(pendingStore, 'Pending store must be in platform pending queue');
+
+  // Non-platform owner cannot approve (403)
+  const forbiddenApprove = await api(`/api/platform/stores/${pendingStore.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}` }
+  });
+  assert.equal(forbiddenApprove.status, 403);
+
+  // Approve store as Platform Owner
+  const approveRes = await api(`/api/platform/stores/${pendingStore.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(approveRes.status, 200);
+  assert.equal(approveRes.data.ok, true);
+
+  // Verify store is now active
+  const storeRow = await db.get('SELECT * FROM stores WHERE id = ?', [pendingStore.id]);
+  assert.equal(storeRow.status, 'active');
+
+  // Verify owner user is now active and approved
+  const ownerUser = await db.get('SELECT * FROM users WHERE user_id = ?', ['fm_owner']);
+  assert.equal(ownerUser.active, 1);
+  assert.equal(ownerUser.approval_status, 'approved');
+
+  // Verify 16 default slots (A1-D4) were initialized for this store
+  const storeSlots = await db.all('SELECT slot, store_id, quantity FROM slots WHERE store_id = ? ORDER BY slot', [pendingStore.id]);
+  assert.equal(storeSlots.length, 16);
+  assert.equal(storeSlots[0].slot, 'A1');
+  assert.equal(storeSlots[15].slot, 'D4');
+
+  // Verify hardware device registered for this store
+  const devRow = await db.get('SELECT * FROM store_devices WHERE store_id = ?', [pendingStore.id]);
+  assert.ok(devRow);
+  assert.equal(devRow.status, 'active');
+  assert.ok(devRow.device_key.startsWith('asrs_hw_'));
+});
+
+test('30. Store Suspension and Re-activation Lifecycle: suspended store blocks tenant operations', async () => {
+  const store = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  assert.ok(store);
+
+  // Suspend store as Platform Owner
+  const suspendRes = await api(`/api/platform/stores/${store.id}/suspend`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(suspendRes.status, 200);
+
+  // Login as store owner
+  const crypto = require('crypto');
+  const ownerToken = 'owner_token_' + crypto.randomBytes(16).toString('hex');
+  await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
+    ownerToken, 'fm_owner', 'Fresh Mart Owner', 'admin'
+  ]);
+
+  // Attempt to access slots of suspended store -> 403 Store is currently suspended
+  const accessRes = await api('/slots', {
+    headers: { Authorization: `Bearer ${ownerToken}`, 'x-store-id': store.id }
+  });
+  assert.equal(accessRes.status, 403);
+  assert.match(accessRes.data.error, /suspended/i);
+
+  // Reactivate store as Platform Owner
+  const reactivateRes = await api(`/api/platform/stores/${store.id}/activate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(reactivateRes.status, 200);
+
+  // Access slots again -> 200 OK
+  const accessActive = await api('/slots', {
+    headers: { Authorization: `Bearer ${ownerToken}`, 'x-store-id': store.id }
+  });
+  assert.equal(accessActive.status, 200);
+});
+
+test('31. Cross-Tenant Slot and Inventory Isolation between Store A and Store B', async () => {
+  // Store A = store_default_001
+  // Store B = Fresh Mart store
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  assert.ok(storeB);
+
+  // Add an operator to Store B
+  const crypto = require('crypto');
+  const opBSalt = crypto.randomBytes(16).toString('hex');
+  const opBHash = crypto.scryptSync('OpPass123!', opBSalt, 64).toString('hex');
+  await db.run(`
+    INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, effective_role)
+    VALUES ('op_freshmart', ?, ?, 'FM Operator', 'operator', 1, 'approved', 'operator')
+  `, [opBHash, opBSalt]);
+  await db.run(`
+    INSERT INTO store_memberships (store_id, user_id, role, status)
+    VALUES (?, 'op_freshmart', 'operator', 'active')
+  `, [storeB.id]);
+  const opBToken = 'token_op_b_' + crypto.randomBytes(16).toString('hex');
+  await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
+    opBToken, 'op_freshmart', 'FM Operator', 'operator'
+  ]);
+
+  // Read initial stock in Store A slot B2
+  const slotA_B2_init = await db.get("SELECT quantity FROM slots WHERE store_id = 'store_default_001' AND slot = 'B2'");
+  const initialStockA = Number(slotA_B2_init.quantity);
+
+  // Store B Operator performs STORE of 5 units in slot B2 of Store B
+  const storeBMovement = await api('/store', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${opBToken}`, 'x-store-id': storeB.id },
+    body: JSON.stringify({ slot: 'B2', quantity: 5, source: 'dashboard' })
+  });
+  assert.equal(storeBMovement.status, 200);
+  assert.equal(storeBMovement.data.slot.quantity, 5);
+  assert.equal(storeBMovement.data.slot.store_id, storeB.id);
+
+  // Verify Store A slot B2 was COMPLETELY UNTOUCHED
+  const slotA_B2_after = await db.get("SELECT quantity FROM slots WHERE store_id = 'store_default_001' AND slot = 'B2'");
+  assert.equal(Number(slotA_B2_after.quantity), initialStockA, 'Store A stock must remain completely unchanged');
+
+  // Transactions query for Store B only returns Store B transactions
+  const txResB = await api('/transactions', {
+    headers: { Authorization: `Bearer ${opBToken}`, 'x-store-id': storeB.id }
+  });
+  assert.equal(txResB.status, 200);
+  assert.ok(txResB.data.every(t => t.store_id === storeB.id));
+});
+
+test('32. Strict Cross-Tenant Access Enforcement: Store A user blocked from Store B with audit logging', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  assert.ok(storeB);
+
+  // Store A Operator (test_op) tries to access Store B slots
+  const trespassSlots = await api('/slots', {
+    headers: { Authorization: `Bearer ${operatorToken}`, 'x-store-id': storeB.id }
+  });
+  assert.equal(trespassSlots.status, 403);
+  assert.match(trespassSlots.data.error, /not an active member/i);
+
+  // Store A Operator tries to store items in Store B rack
+  const trespassStore = await api('/store', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${operatorToken}`, 'x-store-id': storeB.id },
+    body: JSON.stringify({ slot: 'A1', quantity: 2 })
+  });
+  assert.equal(trespassStore.status, 403);
+  assert.match(trespassStore.data.error, /not an active member/i);
+
+  // Verify audit log captured UNAUTHORIZED_CROSS_STORE_ACCESS
+  const auditEntry = await db.get(
+    "SELECT * FROM audit_logs WHERE store_id = ? AND user_id = 'test_op' AND action = 'UNAUTHORIZED_CROSS_STORE_ACCESS'",
+    [storeB.id]
+  );
+  assert.ok(auditEntry, 'Audit log entry must be recorded for unauthorized cross-tenant attempt');
+});
+
+test('33. Hardware Device Multi-Tenant Isolation: device key isolates movement per store', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const devB = await db.get('SELECT device_key FROM store_devices WHERE store_id = ?', [storeB.id]);
+  assert.ok(devB);
+
+  // Hardware movement using Store B device key
+  const hwRes = await api('/api/hardware/store', {
+    method: 'POST',
+    headers: { 'x-hardware-key': devB.device_key },
+    body: JSON.stringify({ slot: 'C1', quantity: 2, source: 'keypad' })
+  });
+  assert.equal(hwRes.status, 200);
+  assert.equal(hwRes.data.storeId, storeB.id);
+  assert.equal(hwRes.data.slot.slot, 'C1');
+
+  // Verify Store B slot C1 updated, while Store A slot C1 was untouched
+  const slotB_C1 = await db.get('SELECT quantity FROM slots WHERE store_id = ? AND slot = ?', [storeB.id, 'C1']);
+  assert.equal(slotB_C1.quantity, 2);
+
+  const slotA_C1 = await db.get("SELECT quantity FROM slots WHERE store_id = 'store_default_001' AND slot = 'C1'");
+  assert.notEqual(slotA_C1.quantity, 2);
+});
+
+test('34. Store Staff Management & Communication Hierarchy Enforcement', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const ownerToken = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerToken);
+
+  // 1. Store Owner adds Store Admin
+  const addAdminRes = await api(`/api/stores/${storeB.id}/members`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}` },
+    body: JSON.stringify({
+      userId: 'fm_admin_1',
+      displayName: 'FM Assistant Manager',
+      role: 'store_admin',
+      password: 'AdminPassword123!',
+      email: 'admin1@freshmart.com'
+    })
+  });
+  assert.equal(addAdminRes.status, 200);
+
+  // Login token for newly created Store Admin
+  const crypto = require('crypto');
+  const adminTokenFM = 'token_fm_admin_' + crypto.randomBytes(16).toString('hex');
+  await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
+    adminTokenFM, 'fm_admin_1', 'FM Assistant Manager', 'admin'
+  ]);
+
+  // 2. Store Admin adds Operator -> MUST SUCCEED
+  const addOpRes = await api(`/api/stores/${storeB.id}/members`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminTokenFM}` },
+    body: JSON.stringify({
+      userId: 'fm_op_picker',
+      displayName: 'Picker One',
+      role: 'operator',
+      password: 'OpPassword123!',
+      email: 'picker1@freshmart.com'
+    })
+  });
+  assert.equal(addOpRes.status, 200);
+
+  // 3. Store Admin attempts to add another Store Admin -> MUST FAIL (403)
+  const addAdminFail = await api(`/api/stores/${storeB.id}/members`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminTokenFM}` },
+    body: JSON.stringify({
+      userId: 'fm_admin_2',
+      displayName: 'Illegal Admin',
+      role: 'store_admin',
+      password: 'AdminPassword123!'
+    })
+  });
+  assert.equal(addAdminFail.status, 403);
+  assert.match(addAdminFail.data.error, /only add Operators/i);
+
+  // 4. Operator attempts to view or manage staff -> MUST FAIL (403)
+  const opTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'op_freshmart'"))?.token;
+  const opViewMembers = await api(`/api/stores/${storeB.id}/members`, {
+    headers: { Authorization: `Bearer ${opTokenFM}` }
+  });
+  assert.equal(opViewMembers.status, 403);
+});
+
+test('35. Sole Store Owner Self-Lockout Protection and Immediate Session Revocation', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const ownerToken = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerToken);
+
+  // 1. Sole Store Owner attempts to deactivate themselves -> MUST FAIL (400)
+  const selfDeactivate = await api(`/api/stores/${storeB.id}/members/fm_owner/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}` }
+  });
+  assert.equal(selfDeactivate.status, 400);
+  assert.match(selfDeactivate.data.error, /only active Store Owner/i);
+
+  // 2. Deactivate an operator -> session immediately invalidated
+  const deactOp = await api(`/api/stores/${storeB.id}/members/fm_op_picker/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}` }
+  });
+  assert.equal(deactOp.status, 200);
+
+  const membership = await db.get("SELECT status FROM store_memberships WHERE store_id = ? AND user_id = 'fm_op_picker'", [storeB.id]);
+  assert.equal(membership.status, 'deactivated');
+});
+
+test('36. User Stores List (/api/user/stores): Platform Owner vs Store Member scoping', async () => {
+  // Platform Owner sees all active stores
+  const poStores = await api('/api/user/stores', {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(poStores.status, 200);
+  assert.ok(poStores.data.stores.length >= 2, 'Platform Owner must see all active stores');
+
+  // Store B operator only sees Store B
+  const opTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'op_freshmart'"))?.token;
+  const opStores = await api('/api/user/stores', {
+    headers: { Authorization: `Bearer ${opTokenFM}` }
+  });
+  assert.equal(opStores.status, 200);
+  assert.equal(opStores.data.stores.length, 1);
+  assert.equal(opStores.data.stores[0].code, 'FM_GROCERY_01');
+});
+
+test('37. SEC-01 Cross-Tenant Isolation: Store B user blocked from Store A with zero auto-enrollment', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const opTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'op_freshmart'"))?.token;
+  assert.ok(opTokenFM, 'Store B operator token must exist');
+
+  // Verify op_freshmart is NOT a member of store_default_001
+  const priorMembership = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'op_freshmart'"
+  );
+  assert.equal(priorMembership, null, 'op_freshmart must not have membership in default store');
+
+  // 1. Store B user attempts to access Store A inventory using x-store-id header
+  const crossStoreAccess = await api('/slots', {
+    headers: {
+      Authorization: `Bearer ${opTokenFM}`,
+      'x-store-id': 'store_default_001'
+    }
+  });
+  assert.equal(crossStoreAccess.status, 403);
+  assert.match(crossStoreAccess.data.error, /not an active member of this store/i);
+
+  // 2. Verify NO membership was dynamically auto-enrolled (SEC-01 guarantee)
+  const afterMembership = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'op_freshmart'"
+  );
+  assert.equal(afterMembership, null, 'Dynamic auto-enrollment must NEVER occur');
+
+  // 3. Verify security incident was recorded in audit_logs
+  const auditEntry = await db.get(
+    "SELECT * FROM audit_logs WHERE user_id = 'op_freshmart' AND action = 'UNAUTHORIZED_CROSS_STORE_ACCESS' ORDER BY id DESC LIMIT 1"
+  );
+  assert.ok(auditEntry, 'Cross-store access attempt must be audited');
+  assert.equal(auditEntry.store_id, 'store_default_001');
+});
+
+test('38. SEC-05 Conflicting Store Identifiers: Request rejected when parameters conflict', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const ownerTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerTokenFM);
+
+  // Send header x-store-id pointing to store_default_001, but query param pointing to storeB.id
+  const conflictRes = await api(`/slots?store_id=${storeB.id}`, {
+    headers: {
+      Authorization: `Bearer ${ownerTokenFM}`,
+      'x-store-id': 'store_default_001'
+    }
+  });
+  assert.equal(conflictRes.status, 400);
+  assert.match(conflictRes.data.error, /Conflicting store identifiers/i);
+});
+
+test('39. SEC-02 Staff Isolation: Store B admin cannot view or modify Store A staff', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const adminTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_admin_1'"))?.token;
+  assert.ok(adminTokenFM, 'Store B admin token must exist');
+
+  // 1. Store B admin calling GET /api/admin/operators only receives Store B operators
+  const opsRes = await api('/api/admin/operators', {
+    headers: { Authorization: `Bearer ${adminTokenFM}` }
+  });
+  assert.equal(opsRes.status, 200);
+  const userIds = opsRes.data.operators.map(o => o.user_id);
+  assert.ok(!userIds.includes('test_op'), 'Store B admin must not see Store A operators');
+
+  // 2. Store B admin calling GET /users only sees Store B operators
+  const usersRes = await api('/users', {
+    headers: { Authorization: `Bearer ${adminTokenFM}` }
+  });
+  assert.equal(usersRes.status, 200);
+  const returnedUserIds = usersRes.data.map(u => u.user_id);
+  assert.ok(!returnedUserIds.includes('test_op'), 'Store B admin must not see Store A users');
+  assert.ok(!returnedUserIds.includes('testboss'), 'Store B admin must not see Store A owner');
+
+  // 3. Store B admin attempting to deactivate Store A operator via /api/admin/operators/:id/deactivate
+  const storeAOp = await db.get("SELECT id FROM users WHERE user_id = 'test_op'");
+  const deactAttempt = await api(`/api/admin/operators/${storeAOp.id}/deactivate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminTokenFM}` }
+  });
+  assert.equal(deactAttempt.status, 404);
+  assert.match(deactAttempt.data.error, /not found in this store/i);
+
+  // 4. Store B admin attempting to modify Store A operator via PATCH /users/:id
+  const patchAttempt = await api(`/users/${storeAOp.id}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${adminTokenFM}` },
+    body: JSON.stringify({ active: false })
+  });
+  assert.equal(patchAttempt.status, 404);
+  assert.match(patchAttempt.data.error, /not found in this store/i);
+});
+
+test('40. SEC-02 Platform Barrier: Store B owner blocked from platform owner routes', async () => {
+  const ownerTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerTokenFM);
+
+  // 1. Blocked from platform stores list
+  const platStores = await api('/api/platform/stores', {
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(platStores.status, 403);
+  assert.match(platStores.data.error, /Platform Owner permission required/i);
+
+  // 2. Blocked from platform pending stores
+  const pendStores = await api('/api/platform/pending-stores', {
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(pendStores.status, 403);
+
+  // 3. Blocked from hardware master key endpoints
+  const hwKey = await api('/hardware/key', {
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(hwKey.status, 403);
+
+  const hwRegen = await api('/hardware/key/regenerate', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(hwRegen.status, 403);
+
+  // 4. Blocked from platform owner pending admin queue
+  const pendAdmins = await api('/api/owner/pending-admins', {
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(pendAdmins.status, 403);
+});
+
+test('41. SEC-03 Rack Isolation: Independent store rack dimensions do not overwrite default store', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const ownerTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerTokenFM);
+
+  // Initial Store A dimensions (rack_config id=1)
+  const rackConfigBefore = await db.get('SELECT rows, cols FROM rack_config WHERE id = 1');
+
+  // Store B expands its rack to 3x5
+  const updateB = await api('/rack/dimensions', {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${ownerTokenFM}`,
+      'x-store-id': storeB.id
+    },
+    body: JSON.stringify({ rows: 3, cols: 5 })
+  });
+  assert.equal(updateB.status, 200);
+  assert.equal(updateB.data.rows, 3);
+  assert.equal(updateB.data.cols, 5);
+
+  // Verify Store B in database has rack_rows=3, rack_cols=5
+  const storeBRow = await db.get('SELECT rack_rows, rack_cols FROM stores WHERE id = ?', [storeB.id]);
+  assert.equal(storeBRow.rack_rows, 3);
+  assert.equal(storeBRow.rack_cols, 5);
+
+  // Crucial SEC-03 assertion: rack_config id = 1 for Store A remains completely untouched
+  const rackConfigAfter = await db.get('SELECT rows, cols FROM rack_config WHERE id = 1');
+  assert.equal(rackConfigAfter.rows, rackConfigBefore.rows, 'Store A rack rows must remain untouched');
+  assert.equal(rackConfigAfter.cols, rackConfigBefore.cols, 'Store A rack cols must remain untouched');
+});
+
+test('42. SEC-04 Hardware Isolation: Store device key rotation immediately invalidates old key', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const ownerTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'fm_owner'"))?.token;
+  assert.ok(ownerTokenFM);
+
+  // Register a new device for Store B
+  const regDev = await api(`/api/stores/${storeB.id}/devices`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerTokenFM}` },
+    body: JSON.stringify({ deviceName: 'ESP32 Shelf Scanner' })
+  });
+  assert.equal(regDev.status, 200);
+  const initialKey = regDev.data.deviceKey;
+  assert.ok(initialKey);
+
+  // Find the device id
+  const devRow = await db.get('SELECT id FROM store_devices WHERE device_key = ?', [initialKey]);
+  assert.ok(devRow);
+
+  // Device can store inventory for Store B using initial key
+  const validHwCall = await api('/api/hardware/store', {
+    method: 'POST',
+    headers: { 'X-Hardware-Key': initialKey },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'keypad' })
+  });
+  assert.equal(validHwCall.status, 200);
+  assert.equal(validHwCall.data.storeId, storeB.id);
+
+  // Rotate device key via POST /api/stores/:storeId/devices/:deviceId/rotate
+  const rotateRes = await api(`/api/stores/${storeB.id}/devices/${devRow.id}/rotate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerTokenFM}` }
+  });
+  assert.equal(rotateRes.status, 200);
+  const rotatedKey = rotateRes.data.deviceKey;
+  assert.ok(rotatedKey);
+  assert.notEqual(rotatedKey, initialKey);
+
+  // Old key MUST now fail with 401 Unauthorized
+  const oldKeyCall = await api('/api/hardware/store', {
+    method: 'POST',
+    headers: { 'X-Hardware-Key': initialKey },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'keypad' })
+  });
+  assert.equal(oldKeyCall.status, 401);
+
+  // New key MUST succeed with 200 OK
+  const newKeyCall = await api('/api/hardware/retrieve', {
+    method: 'POST',
+    headers: { 'X-Hardware-Key': rotatedKey },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'keypad' })
+  });
+  assert.equal(newKeyCall.status, 200);
+  assert.equal(newKeyCall.data.storeId, storeB.id);
+});
+
+test('43. SEC-04 Master Key Atomicity: Platform regeneration synchronizes store_devices for default store', async () => {
+  const regenRes = await api('/hardware/key/regenerate', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(regenRes.status, 200);
+  const newMasterKey = regenRes.data.hardwareApiKey;
+  assert.ok(newMasterKey);
+
+  // Verify system_settings has new key
+  const settingRow = await db.get("SELECT value FROM system_settings WHERE key = 'hardware_api_key'");
+  assert.equal(settingRow.value, newMasterKey);
+
+  // Verify store_devices for store_default_001 has new key
+  const devRow = await db.get("SELECT device_key FROM store_devices WHERE store_id = 'store_default_001'");
+  assert.equal(devRow.device_key, newMasterKey, 'Default store device key must be synchronized atomically');
+
+  // Verify hardware operation succeeds with new master key
+  const hwOk = await api('/api/hardware/store', {
+    method: 'POST',
+    headers: { 'X-Hardware-Key': newMasterKey },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'keypad' })
+  });
+  assert.equal(hwOk.status, 200);
+  assert.equal(hwOk.data.storeId, 'store_default_001');
+
+  // Clean up
+  await api('/api/hardware/retrieve', {
+    method: 'POST',
+    headers: { 'X-Hardware-Key': newMasterKey },
+    body: JSON.stringify({ slot: 'A1', quantity: 1, source: 'keypad' })
+  });
+});
+
+test('44. Transaction & Export Tenant Boundary: User cannot query or export foreign store transactions', async () => {
+  const storeB = await db.get("SELECT id FROM stores WHERE code = 'FM_GROCERY_01'");
+  const opTokenFM = (await db.get("SELECT token FROM user_sessions WHERE user_id = 'op_freshmart'"))?.token;
+  assert.ok(opTokenFM);
+
+  // 1. Store B operator querying /transactions without params gets only Store B transactions
+  const txRes = await api('/transactions', {
+    headers: { Authorization: `Bearer ${opTokenFM}` }
+  });
+  assert.equal(txRes.status, 200);
+  for (const t of txRes.data) {
+    assert.equal(t.store_id, storeB.id, 'Transactions must strictly belong to Store B');
+  }
+
+  // 2. Store B operator attempts to query foreign store via query param ?store_id=store_default_001 -> 403
+  const foreignTxRes = await api('/transactions?store_id=store_default_001', {
+    headers: { Authorization: `Bearer ${opTokenFM}` }
+  });
+  assert.equal(foreignTxRes.status, 403);
+  assert.match(foreignTxRes.data.error, /not an active member of this store/i);
+
+  // 3. Store B operator attempts to export foreign store via ?store_id=store_default_001 -> 403
+  const foreignExport = await api('/transactions/export?store_id=store_default_001', {
+    headers: { Authorization: `Bearer ${opTokenFM}` }
+  });
+  assert.equal(foreignExport.status, 403);
+  assert.match(foreignExport.data.error, /not an active member of this store/i);
+});
+
+test('45. Phase 3 Frontend Contracts: Store Switcher, Onboarding Alias & Mobile PWA Integration', async () => {
+  // 1. Verify /api/stores/register alias works cleanly alongside /api/stores/apply
+  const regRes = await api('/api/stores/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'QuickMart Dark Store 02',
+      code: 'QM_DARK_02',
+      storeType: 'dark_store',
+      email: 'owner@qm-dark02.com',
+      ownerUserId: 'qm_owner_02',
+      ownerName: 'QuickMart Owner',
+      password: 'Password123!',
+      applicationReason: 'Dark store 15-min delivery'
+    })
+  });
+  assert.equal(regRes.status, 200);
+  assert.equal(regRes.data.ok, true);
+  assert.equal(regRes.data.code, 'QM_DARK_02');
+
+  // 2. Verify dashboard/index.html UI Contracts
+  const indexHtml = fs.readFileSync(path.join(__dirname, '../../dashboard/index.html'), 'utf8');
+  assert.ok(indexHtml.includes('id="storeSwitcherWrap"'), 'HTML must include Store Switcher container');
+  assert.ok(indexHtml.includes('id="storeSelect"'), 'HTML must include #storeSelect dropdown');
+  assert.ok(indexHtml.includes('id="storeTypeBadge"'), 'HTML must include #storeTypeBadge');
+  assert.ok(indexHtml.includes('id="storeRegFields"'), 'HTML must include Store Registration fields');
+  assert.ok(indexHtml.includes('id="storeRegLink"'), 'HTML must include #storeRegLink in footer');
+  assert.ok(indexHtml.includes('id="mobileBottomNav"'), 'HTML must include mobile bottom navigation bar');
+
+  // 3. Verify dashboard/app.js Frontend Logic Contracts
+  const appJs = fs.readFileSync(path.join(__dirname, '../../dashboard/app.js'), 'utf8');
+  assert.ok(appJs.includes('async function fetchUserStores()'), 'app.js must define fetchUserStores');
+  assert.ok(appJs.includes('async function switchStore('), 'app.js must define switchStore');
+  assert.ok(appJs.includes('function getCurrentStoreRole()'), 'app.js must define getCurrentStoreRole');
+  assert.ok(appJs.includes('function setupStoreRegHandlers()'), 'app.js must define setupStoreRegHandlers');
+  assert.ok(appJs.includes('function buildMobileNav()'), 'app.js must define buildMobileNav');
+  assert.ok(appJs.includes('function platformStoresPage()'), 'app.js must define platformStoresPage');
+  assert.ok(appJs.includes('function storeStaffPage()'), 'app.js must define storeStaffPage');
+  assert.ok(appJs.includes('function storeDevicesPage()'), 'app.js must define storeDevicesPage');
+  assert.ok(appJs.includes("'x-store-id': activeStoreId"), 'Excel export must include x-store-id header');
+
+  // 4. Verify dashboard/style.css Responsive Styling Contracts
+  const styleCss = fs.readFileSync(path.join(__dirname, '../../dashboard/style.css'), 'utf8');
+  assert.ok(styleCss.includes('.store-switcher-wrap'), 'CSS must include .store-switcher-wrap');
+  assert.ok(styleCss.includes('.mobile-bottom-nav'), 'CSS must include .mobile-bottom-nav');
+  assert.ok(styleCss.includes('@media') && styleCss.includes('max-width: 768px'), 'CSS must include responsive media queries');
+});
+
+test('46. Startup Backfill Idempotency & Zero Auto-Enrollment: initDb does not grant default-store membership to Store B users', async () => {
+  // Confirm op_freshmart exists and is active
+  const opUser = await db.get("SELECT * FROM users WHERE user_id = 'op_freshmart'");
+  assert.ok(opUser, 'Store B operator op_freshmart must exist in users table');
+
+  // Verify op_freshmart does NOT have membership in default store
+  const memBefore = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'op_freshmart'"
+  );
+  assert.equal(memBefore, null, 'op_freshmart must NOT have default store membership before initDb');
+
+  // Execute database initialization/startup backfill again
+  await db.initDb();
+
+  // Verify op_freshmart STILL does not have default store membership
+  const memAfter = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'op_freshmart'"
+  );
+  assert.equal(memAfter, null, 'initDb must NOT silently grant default store membership to Store B users');
+
+  // Verify default store integrity is preserved
+  const testbossMember = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'testboss'"
+  );
+  assert.ok(testbossMember, 'testboss must retain store_owner membership in default store');
+  assert.equal(testbossMember.status, 'active');
+
+  const defaultStoreSlots = await db.get(
+    "SELECT COUNT(*) as n FROM slots WHERE store_id = 'store_default_001'"
+  );
+  assert.ok(Number(defaultStoreSlots.n) >= 16, 'Default store must maintain its slots');
+});

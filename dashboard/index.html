@@ -157,9 +157,50 @@
       </div>
     </div>
 
+    <div id="storeRegFields" class="form hidden">
+      <div class="setup-section">NEW STORE REGISTRATION (SAAS ONBOARDING)</div>
+      <p class="form-desc">Apply to register an independent grocery store, quick-commerce dark store, supermarket, or warehouse on the ASRS SaaS platform.</p>
+      <label for="storeRegName">Store / Business Name *</label>
+      <input id="storeRegName" placeholder="e.g. FreshMart Dark Store 01">
+      <label for="storeRegCode">Store Code * (2-20 characters, e.g. FM_GROCERY_01)</label>
+      <input id="storeRegCode" placeholder="e.g. FM_GROCERY_01">
+      <label for="storeRegType">Store Type *</label>
+      <select id="storeRegType" class="search" style="width:100%;max-width:none;padding:12px;">
+        <option value="grocery">Grocery Store</option>
+        <option value="dark_store">Quick-Commerce Dark Store</option>
+        <option value="supermarket">Supermarket</option>
+        <option value="warehouse">Storage Warehouse</option>
+      </select>
+      <label for="storeRegCity">City</label>
+      <input id="storeRegCity" placeholder="e.g. Mumbai, Nagpur">
+      <label for="storeRegAddress">Store Address</label>
+      <input id="storeRegAddress" placeholder="e.g. Sector 4, Industrial Area">
+      <div class="setup-section" style="margin-top:12px;">STORE OWNER ACCOUNT</div>
+      <label for="storeRegOwnerName">Owner Full Name</label>
+      <input id="storeRegOwnerName" placeholder="e.g. Rajesh Kumar">
+      <label for="storeRegOwnerUser">Desired Owner User ID *</label>
+      <input id="storeRegOwnerUser" placeholder="e.g. fm_owner">
+      <label for="storeRegEmail">Business Email *</label>
+      <input id="storeRegEmail" type="email" placeholder="owner@store.com">
+      <label for="storeRegPhone">Mobile Phone</label>
+      <input id="storeRegPhone" type="tel" placeholder="+919876543210">
+      <label for="storeRegPass">Account Password (min. 8 characters) *</label>
+      <div class="password-wrap">
+        <input id="storeRegPass" type="password" placeholder="At least 8 characters">
+        <button type="button" class="show-pass" data-target="storeRegPass">Show</button>
+      </div>
+      <label for="storeRegReason">Business Context / Reason</label>
+      <input id="storeRegReason" placeholder="e.g. Quick-commerce 15-minute delivery hub">
+      <button type="button" id="storeRegSubmitBtn" class="primary wide">Submit Store Registration Application →</button>
+      <div class="form-sub-row center">
+        <a href="#" class="regBackLink text-link">← Back to Sign in</a>
+      </div>
+    </div>
+
     <div class="login-footer-links" id="loginFooterLinks" style="margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 13px; display: flex; flex-direction: column; gap: 8px;">
       <div>Need warehouse floor access? <a href="#" id="opRegLink" class="text-link">Apply for Operator Access</a></div>
       <div>Need warehouse manager access? <a href="#" id="adminRegLink" class="text-link">Apply for Admin Access</a></div>
+      <div>Starting a new dark store or warehouse? <a href="#" id="storeRegLink" class="text-link">Register New Store / Tenant</a></div>
     </div>
   </div>
 </div>
@@ -179,12 +220,24 @@
   </aside>
   <main class="main">
     <header>
-      <div>
+      <div class="header-left">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
           <span class="eyebrow" id="topWarehouseLabel">SMART WAREHOUSE / OPERATIONS</span>
           <span class="badge" style="background:#e0e7ff;color:#3730a3;font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;border:1px solid #c7d2fe;">SIMULATION MODE (Software Only)</span>
         </div>
-        <h2 id="pageTitle">Dashboard</h2>
+        <div class="header-title-row" style="display:flex;align-items:center;gap:14px;margin-top:4px;flex-wrap:wrap;">
+          <h2 id="pageTitle" style="margin:0;">Dashboard</h2>
+          <!-- Store Switcher Component -->
+          <div id="storeSwitcherWrap" class="store-switcher-wrap">
+            <span class="store-switcher-label">Store:</span>
+            <div class="store-switcher-box">
+              <select id="storeSelect" class="store-select" aria-label="Select active store">
+                <option value="">Loading stores...</option>
+              </select>
+              <span id="storeTypeBadge" class="badge store-type-badge">—</span>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="user">
         <div id="avatar">U</div>
@@ -194,6 +247,7 @@
     </header>
     <section id="content"></section>
     <footer>AS/RS Portable Control Center <span>•</span> Live Inventory, Dynamic Rack & ESP32 Integration</footer>
+    <nav id="mobileBottomNav" class="mobile-bottom-nav"></nav>
   </main>
 </div>
 

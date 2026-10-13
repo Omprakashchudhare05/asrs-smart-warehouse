@@ -5,24 +5,48 @@ let hardwareKey = '';
 let inventoryFilter = '', historyFilter = '';
 let refreshInterval = null;
 
+// Multi-Tenant SaaS State
+let userStores = [];
+let activeStoreId = '';
+let activeStore = null;
+let isPlatformOwner = false;
+let platformStoresList = [];
+let platformPendingStoresList = [];
+let storeMembersList = [];
+let storeDevicesList = [];
+
 const $ = id => document.getElementById(id);
 
 const menus = {
+  platform_owner: [
+    ['dashboard', '▣', 'Dashboard'],
+    ['inventory', '▤', 'Inventory'],
+    ['rack', '▦', 'Dynamic Rack'],
+    ['history', '◷', 'History & Export'],
+    ['platform_stores', '🏬', 'Platform Stores'],
+    ['approvals', '✓', 'Admin Approvals'],
+    ['settings', '⚙', 'Settings & Hardware'],
+    ['profile', '👤', 'My Profile']
+  ],
   owner: [
     ['dashboard', '▣', 'Dashboard'],
     ['inventory', '▤', 'Inventory'],
     ['rack', '▦', 'Dynamic Rack'],
-    ['history', '◷', 'History'],
+    ['history', '◷', 'History & Export'],
+    ['store_staff', '👥', 'Store Staff'],
+    ['store_devices', '📱', 'Store Devices'],
     ['approvals', '✓', 'Approval Queue'],
     ['admin_mgmt', '♟', 'Admin Management'],
     ['users', '👥', 'User Management'],
-    ['settings', '⚙', 'Settings & Hardware']
+    ['settings', '⚙', 'Settings & Hardware'],
+    ['profile', '👤', 'My Profile']
   ],
   admin: [
     ['dashboard', '▣', 'Dashboard'],
     ['inventory', '▤', 'Warehouse Inventory'],
-    ['history', '◷', 'History'],
-    ['approvals', '✓', 'Operator Approvals'],
+    ['history', '◷', 'History & Export'],
+    ['store_staff', '👥', 'Store Staff'],
+    ['store_devices', '📱', 'Store Devices'],
     ['operator_mgmt', '♟', 'Operator Management'],
     ['profile', '👤', 'My Profile']
   ],
@@ -36,16 +60,148 @@ const menus = {
   ]
 };
 menus.boss = menus.owner;
+menus.store_owner = menus.owner;
+menus.store_admin = menus.admin;
+
+function getCurrentStoreRole() {
+  if (isPlatformOwner) return 'platform_owner';
+  if (activeStore && activeStore.role) return activeStore.role;
+  if (me && me.role) return me.role;
+  return 'operator';
+}
+
+function formatStoreType(t) {
+  const map = {
+    grocery: 'Grocery Store',
+    dark_store: 'Dark Store',
+    supermarket: 'Supermarket',
+    warehouse: 'Warehouse'
+  };
+  return map[t] || (t ? String(t).replace(/_/g, ' ') : 'Store');
+}
+
+async function fetchUserStores() {
+  try {
+    const res = await raw('/api/user/stores');
+    userStores = res.stores || [];
+    const select = $('storeSelect');
+    if (!select) return;
+
+    if (userStores.length === 0) {
+      select.innerHTML = '<option value="">No authorized stores</option>';
+      if ($('storeTypeBadge')) $('storeTypeBadge').textContent = 'None';
+      activeStoreId = '';
+      activeStore = null;
+      return;
+    }
+
+    const savedStoreId = sessionStorage.getItem('asrsActiveStoreId');
+    const matchedStore = userStores.find(s => s.id === savedStoreId);
+    activeStore = matchedStore || userStores[0];
+    activeStoreId = activeStore.id;
+    sessionStorage.setItem('asrsActiveStoreId', activeStoreId);
+
+    select.innerHTML = userStores.map(s =>
+      `<option value="${s.id}" ${s.id === activeStoreId ? 'selected' : ''}>${esc(s.name)} (${esc(s.code)})</option>`
+    ).join('');
+
+    if ($('storeTypeBadge')) {
+      $('storeTypeBadge').textContent = formatStoreType(activeStore.store_type);
+    }
+    if ($('topWarehouseLabel')) {
+      $('topWarehouseLabel').textContent = `${(activeStore.name || 'WAREHOUSE').toUpperCase()} / ${activeStore.code || activeStore.id}`;
+    }
+  } catch (err) {
+    console.error('Failed to load user stores:', err);
+    if ($('storeSelect')) $('storeSelect').innerHTML = '<option value="">Failed to load stores</option>';
+  }
+}
+
+async function switchStore(newStoreId) {
+  if (!newStoreId || newStoreId === activeStoreId) return;
+  const target = userStores.find(s => s.id === newStoreId);
+  if (!target && !isPlatformOwner) {
+    return toast('Unauthorized store selection', true);
+  }
+
+  // Clear stale data to prevent bleed
+  slots = [];
+  transactions = [];
+  storeMembersList = [];
+  storeDevicesList = [];
+  rackConfig = { rows: target?.rack_rows || 4, cols: target?.rack_cols || 4 };
+
+  activeStoreId = newStoreId;
+  activeStore = target || { id: newStoreId, name: newStoreId, code: newStoreId };
+  sessionStorage.setItem('asrsActiveStoreId', activeStoreId);
+
+  if ($('storeTypeBadge')) {
+    $('storeTypeBadge').textContent = formatStoreType(activeStore.store_type);
+  }
+  if ($('topWarehouseLabel')) {
+    $('topWarehouseLabel').textContent = `${(activeStore.name || 'WAREHOUSE').toUpperCase()} / ${activeStore.code || activeStore.id}`;
+  }
+
+  const role = getCurrentStoreRole();
+  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : (roleLabels[role] || roleLabels[me.role] || 'Warehouse User');
+
+  buildNav();
+  buildMobileNav();
+  toast(`Switched active store to: ${activeStore.name}`);
+  await load();
+}
 
 async function raw(path, opt = {}) {
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(opt.headers || {})
+  };
+
+  if (token) {
+    headers['Authorization'] = 'Bearer ' + token;
+  }
+
+  // Central Tenant Header Resolution (SEC-05 compliance)
+  // 1. If path explicitly specifies /api/stores/:storeId/..., use matching storeId
+  const storeUrlMatch = path.match(/^\/api\/stores\/([^/?#]+)/);
+  if (storeUrlMatch) {
+    const urlStoreId = storeUrlMatch[1];
+    if (urlStoreId !== 'register') {
+      headers['x-store-id'] = urlStoreId;
+    }
+  } else {
+    // 2. Attach x-store-id only to tenant-scoped routes (never to auth, public, or platform-only routes)
+    const isGlobalOrAuth =
+      path.startsWith('/health') ||
+      path.startsWith('/auth/') ||
+      path.startsWith('/api/platform/') ||
+      path === '/api/user/stores' ||
+      path === '/api/stores/register' ||
+      path.startsWith('/hardware/key') ||
+      path.startsWith('/api/owner/pending-admins');
+
+    if (!isGlobalOrAuth && activeStoreId) {
+      headers['x-store-id'] = activeStoreId;
+    }
+  }
+
   const r = await fetch(BACKEND + path, {
     ...opt,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: 'Bearer ' + token } : {}),
-      ...(opt.headers || {})
-    }
+    headers
   });
+
+  // Handle session revocation (401)
+  if (r.status === 401) {
+    if (!path.startsWith('/auth/login') && !path.startsWith('/auth/forgot-password') && !path.startsWith('/auth/register')) {
+      token = '';
+      me = null;
+      sessionStorage.clear();
+      toast('Session expired or revoked. Please log in again.', true);
+      setTimeout(() => location.reload(), 1500);
+      throw Error('Session expired or revoked. Please log in again.');
+    }
+  }
+
   let d = {};
   try { d = await r.json(); } catch {}
   if (!r.ok || d.ok === false) throw Error(d.error || `Request failed (${r.status})`);
@@ -77,6 +233,7 @@ async function init() {
 
       setupForgotPassHandlers();
       setupRegistrationHandlers();
+      setupStoreRegHandlers();
 
       // Check for saved session in sessionStorage for seamless re-opening
       const savedToken = sessionStorage.getItem('asrsToken');
@@ -85,8 +242,10 @@ async function init() {
         token = savedToken;
         me = JSON.parse(savedUser);
         try {
-          await load();
+          isPlatformOwner = me.platformRole === 'platform_owner' || me.userId === 'testboss';
+          await fetchUserStores();
           showApp();
+          await load();
           startAutoRefresh();
           return;
         } catch {
@@ -498,6 +657,92 @@ function setupRegistrationHandlers() {
   }
 }
 
+function setupStoreRegHandlers() {
+  const storeLink = $('storeRegLink');
+  const storeSubmitBtn = $('storeRegSubmitBtn');
+
+  if (storeLink) {
+    storeLink.onclick = (e) => {
+      e.preventDefault();
+      $('loginFields').classList.add('hidden');
+      $('forgotFields').classList.add('hidden');
+      $('opRegFields').classList.add('hidden');
+      $('adminRegFields').classList.add('hidden');
+      $('storeRegFields').classList.remove('hidden');
+      $('enterBtn').classList.add('hidden');
+      $('roleChoice')?.classList.add('hidden');
+      $('loginNote')?.classList.add('hidden');
+      $('loginFooterLinks')?.classList.add('hidden');
+      $('loginTitle').textContent = 'Register New Store / Tenant';
+      $('loginHint').textContent = 'Apply to onboard your grocery, dark store, supermarket, or warehouse.';
+      $('loginError').textContent = '';
+    };
+  }
+
+  if (storeSubmitBtn) {
+    storeSubmitBtn.onclick = async () => {
+      try {
+        $('loginError').textContent = '';
+        const name = $('storeRegName').value.trim();
+        const code = $('storeRegCode').value.trim();
+        const storeType = $('storeRegType').value;
+        const city = $('storeRegCity').value.trim();
+        const address = $('storeRegAddress').value.trim();
+        const ownerName = $('storeRegOwnerName').value.trim();
+        const ownerUserId = $('storeRegOwnerUser').value.trim();
+        const email = $('storeRegEmail').value.trim();
+        const phone = $('storeRegPhone').value.trim();
+        const password = $('storeRegPass').value;
+        const applicationReason = $('storeRegReason').value.trim();
+
+        if (!name) throw Error('Store / Business name is required');
+        if (!code) throw Error('Store code is required (e.g. FM_GROCERY_01)');
+        if (!ownerUserId) throw Error('Owner User ID is required');
+        if (!email) throw Error('Business email is required');
+        if (!password || password.length < 8) throw Error('Password must be at least 8 characters');
+
+        storeSubmitBtn.disabled = true;
+        storeSubmitBtn.textContent = 'Submitting application...';
+
+        const res = await raw('/api/stores/register', {
+          method: 'POST',
+          body: JSON.stringify({
+            name,
+            code,
+            storeType,
+            city,
+            address,
+            ownerName,
+            ownerUserId,
+            email,
+            phone,
+            password,
+            applicationReason
+          })
+        });
+
+        toast(res.message);
+        $('storeRegFields').classList.add('hidden');
+        $('loginFields').classList.remove('hidden');
+        $('enterBtn').classList.remove('hidden');
+        $('roleChoice')?.classList.remove('hidden');
+        $('loginNote')?.classList.remove('hidden');
+        $('loginFooterLinks')?.classList.remove('hidden');
+        $('loginTitle').textContent = 'Application Submitted';
+        $('loginHint').textContent = 'Your store registration has been submitted and is pending Platform Owner review.';
+        $('loginError').textContent = res.message;
+        $('loginUser').value = ownerUserId;
+        $('loginPass').value = '';
+      } catch (err) {
+        $('loginError').textContent = err.message;
+      } finally {
+        storeSubmitBtn.disabled = false;
+        storeSubmitBtn.textContent = 'Submit Store Registration Application →';
+      }
+    };
+  }
+}
+
 async function login() {
   try {
     const d = await raw('/auth/login', {
@@ -511,6 +756,8 @@ async function login() {
     me = d.user;
     sessionStorage.setItem('asrsToken', token);
     sessionStorage.setItem('asrsUser', JSON.stringify(me));
+    isPlatformOwner = me.platformRole === 'platform_owner' || me.userId === 'testboss';
+    await fetchUserStores();
     showApp();
     await load();
     startAutoRefresh();
@@ -522,10 +769,12 @@ async function login() {
 function showApp() {
   $('login').classList.add('hidden');
   $('app').classList.remove('hidden');
+  const role = getCurrentStoreRole();
   $('userName').textContent = me.displayName;
-  $('userRole').textContent = roleLabels[me.role] || 'Warehouse User';
+  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : (roleLabels[role] || roleLabels[me.role] || 'Warehouse User');
   $('avatar').textContent = (me.displayName || 'U')[0].toUpperCase();
   buildNav();
+  buildMobileNav();
   navigate('dashboard');
 }
 
@@ -539,20 +788,75 @@ $('logout').onclick = async () => {
 };
 
 function buildNav() {
-  const currentMenu = menus[me.role] || menus.operator;
+  const role = getCurrentStoreRole();
+  const currentMenu = menus[role] || menus.operator;
   $('nav').innerHTML = currentMenu.map(([id, ico, label]) =>
     `<button data-page="${id}"><span class="ico">${ico}</span><span>${label}</span></button>`
   ).join('');
   document.querySelectorAll('nav button').forEach(b => b.onclick = () => navigate(b.dataset.page));
 }
 
+function buildMobileNav() {
+  const el = $('mobileBottomNav');
+  if (!el) return;
+  const role = getCurrentStoreRole();
+  let mobileTabs = [];
+  if (role === 'platform_owner') {
+    mobileTabs = [
+      ['dashboard', '▣', 'Dashboard'],
+      ['inventory', '▤', 'Inventory'],
+      ['platform_stores', '🏬', 'Stores'],
+      ['approvals', '✓', 'Approvals'],
+      ['settings', '⚙', 'Settings']
+    ];
+  } else if (role === 'owner' || role === 'store_owner' || role === 'boss') {
+    mobileTabs = [
+      ['dashboard', '▣', 'Dashboard'],
+      ['inventory', '▤', 'Inventory'],
+      ['rack', '▦', 'Rack'],
+      ['history', '◷', 'History'],
+      ['store_staff', '👥', 'Staff']
+    ];
+  } else if (role === 'admin' || role === 'store_admin') {
+    mobileTabs = [
+      ['dashboard', '▣', 'Dashboard'],
+      ['inventory', '▤', 'Inventory'],
+      ['history', '◷', 'History'],
+      ['store_staff', '👥', 'Staff'],
+      ['profile', '👤', 'Profile']
+    ];
+  } else {
+    mobileTabs = [
+      ['dashboard', '▣', 'Dashboard'],
+      ['inventory', '▤', 'Inventory'],
+      ['store', '📥', 'Store'],
+      ['retrieve', '📤', 'Retrieve'],
+      ['profile', '👤', 'Profile']
+    ];
+  }
+
+  el.innerHTML = mobileTabs.map(([id, ico, label]) =>
+    `<button class="mobile-nav-btn ${page === id ? 'active' : ''}" data-page="${id}">
+       <span class="mobile-nav-ico">${ico}</span>
+       <span class="mobile-nav-lbl">${label}</span>
+     </button>`
+  ).join('');
+
+  el.querySelectorAll('.mobile-nav-btn').forEach(b => {
+    b.onclick = () => navigate(b.dataset.page);
+  });
+}
+
 function navigate(p) {
-  const currentMenu = menus[me.role] || menus.operator;
+  const role = getCurrentStoreRole();
+  const currentMenu = menus[role] || menus.operator;
   if (!currentMenu.some(x => x[0] === p)) p = 'dashboard';
   page = p;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.page === p));
+  document.querySelectorAll('.mobile-nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === p));
   $('pageTitle').textContent = currentMenu.find(x => x[0] === p)?.[2] || p;
   render();
+  load();
 }
 
 let pendingAdminsList = [];
@@ -576,6 +880,34 @@ async function load() {
     ]);
     slots = slotsData;
     transactions = txData;
+    if (page === 'platform_stores' && isPlatformOwner) {
+      try {
+        const [storesRes, pendingRes] = await Promise.all([
+          api('/api/platform/stores'),
+          api('/api/platform/pending-stores')
+        ]);
+        platformStoresList = storesRes.stores || [];
+        platformPendingStoresList = pendingRes.stores || [];
+      } catch (err) {
+        console.error('Failed to load platform stores:', err);
+      }
+    }
+    if (page === 'store_staff' && activeStoreId) {
+      try {
+        const res = await api(`/api/stores/${activeStoreId}/members`);
+        storeMembersList = res.members || [];
+      } catch (err) {
+        console.error('Failed to load store members:', err);
+      }
+    }
+    if (page === 'store_devices' && activeStoreId) {
+      try {
+        const res = await api(`/api/stores/${activeStoreId}/devices`);
+        storeDevicesList = res.devices || [];
+      } catch (err) {
+        console.error('Failed to load store devices:', err);
+      }
+    }
     if (page === 'users' && (me.role === 'owner' || me.role === 'boss')) {
       try { users = await api('/users'); } catch {}
     }
@@ -592,20 +924,20 @@ async function load() {
       } catch {}
     }
     if (page === 'approvals') {
-      if (me.role === 'owner' || me.role === 'boss') {
+      if (me.role === 'owner' || me.role === 'boss' || isPlatformOwner) {
         try {
           const resA = await api('/api/owner/pending-admins');
           pendingAdminsList = resA.requests || [];
         } catch {}
       }
-      if (me.role === 'owner' || me.role === 'boss' || me.role === 'admin') {
+      if (me.role === 'owner' || me.role === 'boss' || me.role === 'admin' || isPlatformOwner) {
         try {
           const resO = await api('/api/admin/pending-operators');
           pendingOpsList = resO.requests || [];
         } catch {}
       }
     }
-    if (page === 'settings' && (me.role === 'owner' || me.role === 'boss')) {
+    if (page === 'settings' && (me.role === 'owner' || me.role === 'boss' || isPlatformOwner)) {
       try {
         const hw = await api('/hardware/key');
         hardwareKey = hw.hardwareApiKey;
@@ -1410,6 +1742,314 @@ function retrievePage() {
   `;
 }
 
+function platformStoresPage() {
+  const activeStores = platformStoresList.filter(s => s.status === 'active');
+  const suspendedStores = platformStoresList.filter(s => s.status === 'suspended');
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Platform Stores Overview</b>
+        <div class="muted">Platform Owner control center: onboard, inspect, approve, and govern all independent stores and dark store tenants.</div>
+      </div>
+      <button class="primary" id="refreshPlatformStores">↻ Refresh Stores</button>
+    </div>
+
+    <!-- PENDING APPLICATIONS -->
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="panel-head">
+        <div>
+          <h3>Pending Store Registration Applications (${platformPendingStoresList.length})</h3>
+          <span class="muted">Applications submitted by independent businesses awaiting platform approval.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Store Name</th>
+              <th>Code</th>
+              <th>Type</th>
+              <th>City</th>
+              <th>Applicant / Owner</th>
+              <th>Contact Details</th>
+              <th>Reason</th>
+              <th>Requested At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${platformPendingStoresList.length ? platformPendingStoresList.map(s => `
+              <tr>
+                <td><b>${esc(s.name)}</b></td>
+                <td><code>${esc(s.code)}</code></td>
+                <td><span class="badge cyan">${esc(formatStoreType(s.store_type))}</span></td>
+                <td>${esc(s.city || '—')}</td>
+                <td><b>${esc(s.owner_name || s.owner_user_id)}</b><br><small class="muted">ID: ${esc(s.owner_user_id)}</small></td>
+                <td>${esc(s.owner_email || '—')}<br><small class="muted">${esc(s.owner_phone || '—')}</small></td>
+                <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">${esc(s.application_reason || '—')}</td>
+                <td><small class="muted">${s.created_at || s.requested_at || '—'}</small></td>
+                <td>
+                  <div style="display:flex;gap:6px;">
+                    <button class="primary approveStoreBtn" data-id="${s.id}" data-name="${attr(s.name)}">Approve</button>
+                    <button class="danger rejectStoreBtn" data-id="${s.id}" data-name="${attr(s.name)}">Reject</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('') : '<tr><td colspan="9" class="empty">No pending store registration applications.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ALL PLATFORM STORES -->
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>All Registered Platform Stores (${platformStoresList.length})</h3>
+          <span class="muted">Active and suspended grocery stores, quick-commerce dark stores, and warehouses.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Store Name</th>
+              <th>Store Code</th>
+              <th>Store Type</th>
+              <th>Status</th>
+              <th>Slots</th>
+              <th>Active Staff</th>
+              <th>Owner ID</th>
+              <th>Created At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${platformStoresList.length ? platformStoresList.map(s => `
+              <tr>
+                <td>
+                  <b>${esc(s.name)}</b>
+                  ${s.id === activeStoreId ? '<span class="badge blue" style="margin-left:6px;">Active Store</span>' : ''}
+                </td>
+                <td><code>${esc(s.code)}</code></td>
+                <td><span class="badge cyan">${esc(formatStoreType(s.store_type))}</span></td>
+                <td>
+                  <span class="badge ${s.status === 'active' ? 'green' : s.status === 'suspended' ? 'red' : 'orange'}">
+                    ${s.status.toUpperCase()}
+                  </span>
+                </td>
+                <td><b>${s.slot_count ?? 16}</b> slots</td>
+                <td>${s.active_members_count ?? '—'}</td>
+                <td><code>${esc(s.owner_user_id || 'testboss')}</code></td>
+                <td><small class="muted">${s.created_at || '—'}</small></td>
+                <td>
+                  <div style="display:flex;gap:6px;align-items:center;">
+                    ${s.id !== activeStoreId && s.status === 'active' ? `
+                      <button class="ghost switchToStoreBtn" data-id="${s.id}">Switch To</button>
+                    ` : ''}
+                    ${s.id !== 'store_default_001' ? (
+                      s.status === 'active' ? `
+                        <button class="danger suspendStoreBtn" data-id="${s.id}" data-name="${attr(s.name)}">Suspend</button>
+                      ` : s.status === 'suspended' ? `
+                        <button class="primary activateStoreBtn" data-id="${s.id}" data-name="${attr(s.name)}">Reactivate</button>
+                      ` : ''
+                    ) : '<span class="badge green">Default Store</span>'}
+                  </div>
+                </td>
+              </tr>
+            `).join('') : '<tr><td colspan="9" class="empty">No registered stores found.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function storeStaffPage() {
+  const currentRole = getCurrentStoreRole();
+  const isOwner = currentRole === 'owner' || currentRole === 'store_owner' || currentRole === 'boss' || isPlatformOwner;
+
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Store Staff & Access Control</b>
+        <div class="muted">Manage operators and supervisors for <b>${esc(activeStore?.name || 'Active Store')}</b> (${esc(activeStore?.code || activeStoreId)}).</div>
+      </div>
+      <button class="primary" id="refreshStaff">↻ Refresh Staff</button>
+    </div>
+
+    <div class="grid two">
+      <!-- ADD STAFF FORM -->
+      <div class="panel">
+        <h3>Add Staff Member</h3>
+        <p class="muted">${isOwner ? 'Assign a new Store Admin or Operator to this store.' : 'Assign a new Operator to this store.'}</p>
+        <div class="form">
+          <label for="staffRoleSelect">Staff Role *</label>
+          <select id="staffRoleSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+            <option value="operator">Operator (Picking, packing & stock movements)</option>
+            ${isOwner ? '<option value="store_admin">Store Admin (Supervises store & operators)</option>' : ''}
+          </select>
+
+          <label for="staffUserId">User ID *</label>
+          <input id="staffUserId" placeholder="e.g. op_john or existing user ID">
+
+          <label for="staffDisplayName">Full Display Name *</label>
+          <input id="staffDisplayName" placeholder="e.g. John Doe">
+
+          <label for="staffPassword">Password (8+ chars) *</label>
+          <input id="staffPassword" type="password" placeholder="Min. 8 characters">
+
+          <label for="staffEmail">Work Email</label>
+          <input id="staffEmail" type="email" placeholder="john@example.com">
+
+          <label for="staffPhone">Mobile Phone</label>
+          <input id="staffPhone" type="tel" placeholder="+919876543210">
+
+          <label for="staffEmpId">Employee Badge / ID #</label>
+          <input id="staffEmpId" placeholder="e.g. EMP-101">
+
+          <div class="actions" style="margin-top:16px;">
+            <button class="primary wide" id="addStaffBtn">Add Staff Member →</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- CURRENT STAFF LIST -->
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>Current Store Members (${storeMembersList.length})</h3>
+            <span class="muted">Authorized users with active or deactivated memberships in this store.</span>
+          </div>
+        </div>
+        <div style="margin-top:14px; max-height: 550px; overflow: auto;">
+          ${storeMembersList.length ? storeMembersList.map(m => `
+            <div class="list-row" style="display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #e2e8f0;">
+              <div>
+                <b>${esc(m.display_name || m.user_id)}</b>
+                <span class="badge ${m.role === 'store_owner' ? 'cyan' : m.role === 'store_admin' ? 'orange' : 'green'}" style="margin-left:6px;">
+                  ${m.role === 'store_owner' ? 'Owner' : m.role === 'store_admin' ? 'Admin' : 'Operator'}
+                </span>
+                <div class="muted">
+                  ID: <code>${esc(m.user_id)}</code> · Status: <span class="badge ${m.status === 'active' ? 'green' : 'red'}" style="padding:2px 6px;font-size:10px;">${m.status}</span>
+                  ${m.email ? ' · ' + esc(m.email) : ''}
+                  ${m.employee_id ? ' · Badge: ' + esc(m.employee_id) : ''}
+                </div>
+              </div>
+              <div>
+                ${(m.role !== 'store_owner' && m.user_id !== 'testboss') ? (
+                  m.status === 'active' ? `
+                    <button class="danger deactMemberBtn" data-id="${m.id}" data-name="${attr(m.display_name || m.user_id)}" data-user="${esc(m.user_id)}">Deactivate</button>
+                  ` : `
+                    <button class="primary actMemberBtn" data-id="${m.id}" data-name="${attr(m.display_name || m.user_id)}" data-user="${esc(m.user_id)}">Activate</button>
+                  `
+                ) : '<span class="badge green">Protected</span>'}
+              </div>
+            </div>
+          `).join('') : '<div class="empty">No staff members found for this store.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function storeDevicesPage() {
+  const currentRole = getCurrentStoreRole();
+  const isOwner = currentRole === 'owner' || currentRole === 'store_owner' || currentRole === 'boss' || isPlatformOwner;
+
+  return `
+    <div class="page-actions">
+      <div>
+        <b>Store Hardware Devices & Controllers</b>
+        <div class="muted">Manage edge controllers, ESP32 microcontrollers, and picking stations for <b>${esc(activeStore?.name || 'Active Store')}</b>.</div>
+      </div>
+      <button class="primary" id="refreshDevices">↻ Refresh Devices</button>
+    </div>
+
+    <!-- HARDWARE CONNECTION INFO -->
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="panel-head">
+        <div>
+          <h3>Edge Hardware Connection Details</h3>
+          <span class="muted">Microcontrollers (ESP32) connect via HTTP with store-specific device authentication.</span>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:10px;">
+        <div class="field">
+          <label>Cloud Base URL</label>
+          <div style="display:flex;gap:8px;">
+            <input type="text" readonly value="${window.location.origin}" id="deviceBaseUrlInput">
+            <button class="ghost" id="copyDeviceBaseUrl">Copy</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Movement Endpoints</label>
+          <input type="text" readonly value="POST /api/hardware/store &nbsp;|&nbsp; POST /api/hardware/retrieve">
+        </div>
+      </div>
+      <small class="muted" style="display:block;margin-top:8px;">
+        Send header: <code>x-api-key: &lt;DEVICE_KEY&gt;</code> with JSON payload: <code>{"slot": "A1", "quantity": 1}</code>.
+      </small>
+    </div>
+
+    <div class="grid two">
+      <!-- REGISTER NEW DEVICE (Store Owner only) -->
+      ${isOwner ? `
+        <div class="panel">
+          <h3>Register New Hardware Device</h3>
+          <p class="muted">Add an ESP32 controller, keypad, or barcode station to this store.</p>
+          <div class="form">
+            <label for="newDeviceName">Device Name / Location *</label>
+            <input id="newDeviceName" placeholder="e.g. Shelf Rack 1 ESP32 Controller">
+
+            <div class="actions" style="margin-top:16px;">
+              <button class="primary wide" id="registerDeviceBtn">Register Hardware Device →</button>
+            </div>
+          </div>
+        </div>
+      ` : ''}
+
+      <!-- REGISTERED DEVICES LIST -->
+      <div class="panel" style="${isOwner ? '' : 'grid-column: 1 / -1;'}">
+        <div class="panel-head">
+          <div>
+            <h3>Active Store Devices (${storeDevicesList.length})</h3>
+            <span class="muted">Authorized hardware controllers assigned to this store.</span>
+          </div>
+        </div>
+        <div class="table-wrap" style="margin-top:10px;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Device Name</th>
+                <th>Status</th>
+                <th>Masked Key</th>
+                <th>Registered At</th>
+                ${isOwner ? '<th>Actions</th>' : ''}
+              </tr>
+            </thead>
+            <tbody>
+              ${storeDevicesList.length ? storeDevicesList.map(d => `
+                <tr>
+                  <td><b>${esc(d.device_name)}</b></td>
+                  <td><span class="badge ${d.status === 'active' ? 'green' : 'orange'}">${d.status}</span></td>
+                  <td><code>${esc(d.masked_key || 'asrs_hw_****')}</code></td>
+                  <td><small class="muted">${d.created_at || '—'}</small></td>
+                  ${isOwner ? `
+                    <td>
+                      <button class="danger rotateDeviceBtn" data-id="${d.id}" data-name="${attr(d.device_name)}">Rotate Key</button>
+                    </td>
+                  ` : ''}
+                </tr>
+              `).join('') : '<tr><td colspan="5" class="empty">No hardware devices registered for this store.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function profilePage() {
   return `
     <div class="panel" style="max-width:650px; margin: 0 auto;">
@@ -1458,6 +2098,9 @@ function render() {
     page === 'inventory' ? inventory() :
     page === 'rack' ? rackPage() :
     page === 'history' ? historyPage() :
+    page === 'platform_stores' ? platformStoresPage() :
+    page === 'store_staff' ? storeStaffPage() :
+    page === 'store_devices' ? storeDevicesPage() :
     page === 'users' ? usersPage() :
     page === 'operators' ? usersPage() :
     page === 'admin_mgmt' ? adminMgmtPage() :
@@ -1472,10 +2115,180 @@ function render() {
 }
 
 function wire() {
+  // Store Switcher
+  $('storeSelect')?.addEventListener('change', e => {
+    switchStore(e.target.value);
+  });
+
   $('refresh')?.addEventListener('click', load);
   $('refreshApprovals')?.addEventListener('click', load);
   $('refreshAdmins')?.addEventListener('click', load);
   $('refreshOperators')?.addEventListener('click', load);
+  $('refreshPlatformStores')?.addEventListener('click', load);
+  $('refreshStaff')?.addEventListener('click', load);
+  $('refreshDevices')?.addEventListener('click', load);
+
+  // Platform Stores handlers
+  document.querySelectorAll('.approveStoreBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    if (!confirm(`Approve store registration for '${name}'?\n\nThis will activate the store, initialize default rack slots (A1-D4), activate the store owner account, and generate a primary hardware device key.`)) return;
+    try {
+      const res = await api(`/api/platform/stores/${id}/approve`, { method: 'POST' });
+      toast(res.message);
+      if (res.deviceKey) {
+        alert(`Store '${name}' Approved Successfully!\n\nDefault Hardware API Key:\n${res.deviceKey}\n\nSave this key securely. It can also be rotated in Store Devices.`);
+      }
+      await fetchUserStores();
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.rejectStoreBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const reason = prompt(`Enter rejection reason for store '${name}':`, 'Application does not meet platform requirements');
+    if (reason === null) return;
+    try {
+      const res = await api(`/api/platform/stores/${id}/reject`, {
+        method: 'POST',
+        body: JSON.stringify({ rejectionReason: reason })
+      });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.suspendStoreBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    if (!confirm(`Are you sure you want to suspend store '${name}'?\n\nAll operations in this store will be blocked until reactivated.`)) return;
+    try {
+      const res = await api(`/api/platform/stores/${id}/suspend`, { method: 'POST' });
+      toast(res.message);
+      await fetchUserStores();
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.activateStoreBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    if (!confirm(`Reactivate store '${name}'?`)) return;
+    try {
+      const res = await api(`/api/platform/stores/${id}/activate`, { method: 'POST' });
+      toast(res.message);
+      await fetchUserStores();
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.switchToStoreBtn').forEach(b => b.onclick = () => {
+    const id = b.dataset.id;
+    switchStore(id);
+  });
+
+  // Store Staff handlers
+  $('addStaffBtn')?.addEventListener('click', async () => {
+    const role = $('staffRoleSelect')?.value || 'operator';
+    const userId = $('staffUserId')?.value.trim();
+    const displayName = $('staffDisplayName')?.value.trim();
+    const password = $('staffPassword')?.value;
+    const email = $('staffEmail')?.value.trim();
+    const phone = $('staffPhone')?.value.trim();
+    const employeeId = $('staffEmpId')?.value.trim();
+
+    if (!userId || !displayName || !password) {
+      return toast('User ID, Display Name, and Password (8+ chars) are required', true);
+    }
+
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/members`, {
+        method: 'POST',
+        body: JSON.stringify({ userId, role, displayName, password, email, phone, employeeId })
+      });
+      toast(res.message || 'Staff member added successfully');
+      $('staffUserId').value = '';
+      $('staffDisplayName').value = '';
+      $('staffPassword').value = '';
+      if ($('staffEmail')) $('staffEmail').value = '';
+      if ($('staffPhone')) $('staffPhone').value = '';
+      if ($('staffEmpId')) $('staffEmpId').value = '';
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.deactMemberBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Deactivate store access for member '${name}' (${user})?\n\nTheir sessions for this store will be revoked.`)) return;
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/members/${id}/deactivate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.actMemberBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    const user = b.dataset.user;
+    if (!confirm(`Reactivate store access for member '${name}' (${user})?`)) return;
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/members/${id}/activate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  // Store Hardware Devices handlers
+  $('copyDeviceBaseUrl')?.addEventListener('click', () => {
+    navigator.clipboard.writeText(window.location.origin);
+    toast('Cloud Base URL copied to clipboard');
+  });
+
+  $('registerDeviceBtn')?.addEventListener('click', async () => {
+    const deviceName = $('newDeviceName')?.value.trim() || 'ESP32 Controller';
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/devices`, {
+        method: 'POST',
+        body: JSON.stringify({ deviceName })
+      });
+      alert(`Hardware Device Registered Successfully!\n\nDevice: ${res.deviceName}\nStore ID: ${res.storeId}\nDevice API Key:\n${res.deviceKey}\n\nIMPORTANT: Copy this API key now and flash it to your ESP32 controller.`);
+      if ($('newDeviceName')) $('newDeviceName').value = '';
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.rotateDeviceBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const name = b.dataset.name;
+    if (!confirm(`Rotate API key for '${name}'?\n\nThe existing key will be immediately invalidated and cannot be restored. Any ESP32 controller using the old key must be updated.`)) return;
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/devices/${id}/rotate`, { method: 'POST' });
+      alert(`Device Key Rotated Successfully!\n\nDevice: ${res.deviceName}\nNew Device API Key:\n${res.deviceKey}\n\nUpdate your controller firmware with this new key.`);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 
   // Date filters & Excel export
   $('txApplyFilter')?.addEventListener('click', () => {
@@ -1508,7 +2321,10 @@ function wire() {
 
       toast('Generating Excel export...');
       const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          ...(activeStoreId ? { 'x-store-id': activeStoreId } : {})
+        }
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: 'Export failed' }));

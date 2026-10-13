@@ -99,6 +99,7 @@ const safeUser = u => {
     email_verified: Number(u.email_verified || 0),
     phone_verified: Number(u.phone_verified || 0),
     active: Number(u.active !== undefined ? u.active : 1),
+    platformRole: u.platform_role || (u.user_id === 'testboss' ? 'platform_owner' : null),
     requestedAt: u.requested_at || null,
     reviewedAt: u.reviewed_at || null,
     reviewedBy: u.reviewed_by || null,
@@ -941,17 +942,123 @@ async function authenticateUser(q, r, next) {
     requested_role: session.requested_role
   });
 
+  const fullUser = await db.get("SELECT platform_role FROM users WHERE user_id = ?", [session.user_id]);
+  const isPlatformOwner = fullUser?.platform_role === 'platform_owner' || session.user_id === 'testboss';
+
   q.user = {
     userId: session.user_id,
     displayName: session.db_display_name || session.display_name,
-    role: resolvedRole
+    role: resolvedRole,
+    platformRole: isPlatformOwner ? 'platform_owner' : null
   };
   next();
 }
 
-// Owner Only Middleware
+// Platform Owner Only Middleware
+function platformOwnerOnly(q, r, next) {
+  if (q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss') {
+    return next();
+  }
+  return r.status(403).json({ ok: false, error: 'Platform Owner permission required' });
+}
+
+// Server-Side Tenant Isolation Middleware (SEC-01 & SEC-05 enforced)
+async function tenantContext(q, r, next) {
+  const isPlatformOwner = q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+
+  // SEC-05: Check for conflicting store identifiers across params, headers, query, and body
+  const candidates = [];
+  if (q.params?.storeId) candidates.push({ source: 'param', value: String(q.params.storeId).trim() });
+  if (q.headers['x-store-id']) candidates.push({ source: 'header', value: String(q.headers['x-store-id']).trim() });
+  if (q.query?.store_id) candidates.push({ source: 'query', value: String(q.query.store_id).trim() });
+  if (q.body?.storeId) candidates.push({ source: 'body', value: String(q.body.storeId).trim() });
+
+  const uniqueCandidates = [...new Set(candidates.map(c => c.value).filter(Boolean))];
+  if (uniqueCandidates.length > 1) {
+    return r.status(400).json({ ok: false, error: 'Conflicting store identifiers provided in request' });
+  }
+
+  let targetStoreId = uniqueCandidates[0];
+
+  if (!targetStoreId) {
+    const userMemberships = await db.all(
+      "SELECT m.store_id, m.role, s.name, s.status as store_status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active' ORDER BY m.id ASC",
+      [q.user.userId]
+    );
+
+    if (userMemberships.length > 0) {
+      targetStoreId = userMemberships[0].store_id;
+    } else if (isPlatformOwner) {
+      targetStoreId = 'store_default_001';
+    } else {
+      return r.status(403).json({ ok: false, error: 'Access denied: You are not assigned to any active store' });
+    }
+  }
+
+  const targetStore = await db.get('SELECT * FROM stores WHERE id = ?', [targetStoreId]);
+  if (!targetStore) {
+    return r.status(404).json({ ok: false, error: 'Store not found' });
+  }
+
+  if (targetStore.status !== 'active' && !isPlatformOwner) {
+    return r.status(403).json({ ok: false, error: `Store is currently ${targetStore.status}` });
+  }
+
+  if (isPlatformOwner) {
+    q.storeId = targetStoreId;
+    q.store = targetStore;
+    q.storeRole = 'platform_owner';
+    return next();
+  }
+
+  // SEC-01: Strict server-side membership verification with ZERO dynamic auto-enrollment
+  const membership = await db.get(
+    "SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ? AND status = 'active'",
+    [targetStoreId, q.user.userId]
+  );
+
+  if (!membership) {
+    await db.run(
+      "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES (?, ?, 'UNAUTHORIZED_CROSS_STORE_ACCESS', 'store', ?, ?)",
+      [targetStoreId, q.user.userId, targetStoreId, 'User attempted cross-store access without active membership']
+    ).catch(() => {});
+    return r.status(403).json({ ok: false, error: 'Access denied: You are not an active member of this store' });
+  }
+
+  q.storeId = targetStoreId;
+  q.store = targetStore;
+  q.storeRole = membership.role;
+  next();
+}
+
+// Store Role Middlewares
+function storeOwnerOnly(q, r, next) {
+  if (['store_owner', 'platform_owner'].includes(q.storeRole) || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss') {
+    return next();
+  }
+  return r.status(403).json({ ok: false, error: 'Store Owner permission required' });
+}
+
+function storeAdminOnly(q, r, next) {
+  if (['store_owner', 'store_admin', 'platform_owner'].includes(q.storeRole) || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss') {
+    return next();
+  }
+  return r.status(403).json({ ok: false, error: 'Store Admin permission required' });
+}
+
+function storeOperatorOnly(q, r, next) {
+  if (q.storeRole === 'operator') {
+    return next();
+  }
+  return r.status(403).json({
+    ok: false,
+    error: `Routine store and retrieve operations are restricted to approved Operators only. Your role (${q.storeRole || q.user?.role || 'unknown'}) is not permitted to perform inventory movements directly.`
+  });
+}
+
+// Owner Only Middleware (Platform/Warehouse Owner)
 function ownerOnly(q, r, next) {
-  if (['owner', 'boss'].includes(q.user?.role)) {
+  if (['owner', 'boss'].includes(q.user?.role) || q.user?.platformRole === 'platform_owner' || q.storeRole === 'store_owner') {
     return next();
   }
   return r.status(403).json({ ok: false, error: 'Owner / Super Admin permission required' });
@@ -959,7 +1066,7 @@ function ownerOnly(q, r, next) {
 
 // Admin or Owner Middleware (Admin+)
 function adminOnly(q, r, next) {
-  if (['owner', 'boss', 'admin'].includes(q.user?.role)) {
+  if (['owner', 'boss', 'admin'].includes(q.user?.role) || q.user?.platformRole === 'platform_owner' || ['store_owner', 'store_admin'].includes(q.storeRole)) {
     return next();
   }
   return r.status(403).json({ ok: false, error: 'Admin / Warehouse Manager permission required' });
@@ -967,7 +1074,7 @@ function adminOnly(q, r, next) {
 
 // Operator Only Middleware (routine Store/Retrieve restricted to Operator)
 function operatorOnly(q, r, next) {
-  if (q.user?.role === 'operator') {
+  if (q.user?.role === 'operator' || q.storeRole === 'operator') {
     return next();
   }
   return r.status(403).json({
@@ -986,39 +1093,63 @@ app.get('/auth/me', authenticateUser, async (q, r) => {
   try {
     const u = await db.get('SELECT * FROM users WHERE user_id = ?', [q.user.userId]);
     if (!u) return r.status(404).json({ ok: false, error: 'User not found' });
-    r.json({ ok: true, user: safeUser(u) });
+    const userStores = await db.all(
+      "SELECT s.id, s.name, s.code, s.store_type, m.role, m.status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active' ORDER BY s.name ASC",
+      [q.user.userId]
+    );
+    const safe = safeUser(u);
+    safe.platformRole = q.user.platformRole;
+    safe.stores = userStores;
+    safe.defaultStoreId = userStores[0]?.id || 'store_default_001';
+    r.json({ ok: true, user: safe });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Hardware API Key Authentication Middleware (for ESP32 / Keypad)
+// Hardware API Key Authentication Middleware (for ESP32 / Keypad - Store Scoped)
 async function hardwareAuth(q, r, next) {
-  const key = q.headers['x-hardware-key'] || q.query.key;
+  const key = String(q.headers['x-hardware-key'] || q.query.key || '').trim();
   if (!key) {
     return r.status(401).json({ ok: false, error: 'Missing hardware API key. Device authentication required.' });
   }
-  const setting = await db.get("SELECT value FROM system_settings WHERE key='hardware_api_key'");
-  if (!setting || setting.value !== String(key).trim()) {
-    return r.status(401).json({ ok: false, error: 'Invalid hardware API key.' });
+
+  let device = await db.get("SELECT * FROM store_devices WHERE device_key = ? AND status = 'active'", [key]);
+
+  if (!device) {
+    const setting = await db.get("SELECT value FROM system_settings WHERE key='hardware_api_key'");
+    if (setting && setting.value === key) {
+      device = {
+        store_id: 'store_default_001',
+        device_name: 'Main ESP32 Controller',
+        device_key: key
+      };
+    }
   }
+
+  if (!device) {
+    return r.status(401).json({ ok: false, error: 'Invalid or deactivated hardware API key.' });
+  }
+
+  q.device = device;
+  q.storeId = device.store_id;
   q.user = {
-    userId: 'esp32_device',
-    displayName: 'ESP32 Device',
+    userId: `device_${String(device.device_name).toLowerCase().replace(/[^a-z0-9_]/g, '_')}`,
+    displayName: device.device_name,
     role: 'hardware'
   };
   next();
 }
 
 // Unified Atomic Movement Handler (Store & Retrieve - Race condition & double-click safe)
-async function handleMovement(action, slotCode, itemNum, quantity, source, user) {
+async function handleMovement(action, slotCode, itemNum, quantity, source, user, storeId = 'store_default_001') {
   quantity = Number(quantity);
   if (!Number.isInteger(quantity) || quantity < 1) {
     throw Error('Quantity must be a positive whole number');
   }
   const code = String(slotCode || '').trim().toUpperCase();
-  const s = await db.get('SELECT * FROM slots WHERE slot=?', [code]);
-  if (!s) throw Error(`Slot ${code} not found in warehouse rack`);
+  const s = await db.get('SELECT * FROM slots WHERE store_id = ? AND slot = ?', [storeId, code]);
+  if (!s) throw Error(`Slot ${code} not found in store rack`);
 
   if (itemNum && Number(itemNum) !== s.item) {
     throw Error('Selected item ID does not match the slot');
@@ -1028,21 +1159,21 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
   let result;
   if (action === 'STORE') {
     result = await db.run(
-      'UPDATE slots SET quantity = quantity + ?, occupied = 1 WHERE slot = ? AND (quantity + ?) <= capacity',
-      [quantity, code, quantity]
+      'UPDATE slots SET quantity = quantity + ?, occupied = 1 WHERE store_id = ? AND slot = ? AND (quantity + ?) <= capacity',
+      [quantity, storeId, code, quantity]
     );
   } else if (action === 'RETRIEVE') {
     result = await db.run(
-      'UPDATE slots SET quantity = quantity - ?, occupied = CASE WHEN (quantity - ?) > 0 THEN 1 ELSE 0 END WHERE slot = ? AND (quantity - ?) >= 0',
-      [quantity, quantity, code, quantity]
+      'UPDATE slots SET quantity = quantity - ?, occupied = CASE WHEN (quantity - ?) > 0 THEN 1 ELSE 0 END WHERE store_id = ? AND slot = ? AND (quantity - ?) >= 0',
+      [quantity, quantity, storeId, code, quantity]
     );
   } else {
     throw Error(`Unsupported movement action: ${action}`);
   }
 
   if (result.changes === 0) {
-    const cur = await db.get('SELECT quantity, capacity FROM slots WHERE slot=?', [code]);
-    if (!cur) throw Error(`Slot ${code} not found in warehouse rack`);
+    const cur = await db.get('SELECT quantity, capacity FROM slots WHERE store_id = ? AND slot = ?', [storeId, code]);
+    if (!cur) throw Error(`Slot ${code} not found in store rack`);
     if (action === 'STORE') {
       const free = Math.max(0, Number(cur.capacity || 10) - Number(cur.quantity || 0));
       throw Error(`Slot capacity exceeded. Available free space: ${free} unit(s)`);
@@ -1052,7 +1183,7 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
     }
   }
 
-  const updatedSlot = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE slot=?", [code]);
+  const updatedSlot = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, store_id, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE store_id = ? AND slot = ?", [storeId, code]);
 
   const after = Number(updatedSlot.quantity);
   const before = action === 'STORE' ? after - quantity : after + quantity;
@@ -1060,8 +1191,8 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
   await db.run(`
     INSERT INTO transactions (
       action, slot, item, item_name, sku, source, time,
-      quantity, before_quantity, after_quantity, user_name, role, user_id
-    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+      quantity, before_quantity, after_quantity, user_name, role, user_id, store_id
+    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
   `, [
     action,
     updatedSlot.slot,
@@ -1074,18 +1205,140 @@ async function handleMovement(action, slotCode, itemNum, quantity, source, user)
     after,
     user?.displayName || user?.userId || 'System',
     user?.role || 'operator',
-    user?.userId || null
+    user?.userId || null,
+    storeId
   ]);
 
   return updatedSlot;
 }
 
+// ---------------- PUBLIC MULTI-TENANT STORE ONBOARDING ----------------
+const handleStoreApply = async (q, r) => {
+  try {
+    const {
+      name,
+      code,
+      storeType = 'grocery',
+      ownerUserId,
+      ownerName,
+      email,
+      phone,
+      address,
+      city,
+      password,
+      applicationReason
+    } = q.body || {};
+
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw Error('Store business name is required');
+
+    const cleanCode = String(code || '').trim().toUpperCase();
+    if (!cleanCode || !/^[A-Z0-9_-]{2,20}$/.test(cleanCode)) {
+      throw Error('Store code must be 2-20 alphanumeric characters, hyphens or underscores (e.g. GROCERY_01)');
+    }
+
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw Error('A valid business email address is required');
+    }
+
+    if (!password || String(password).length < 8) {
+      throw Error('Account password with at least 8 characters is required');
+    }
+
+    const cleanOwnerName = String(ownerName || '').trim() || (cleanName + ' Owner');
+    const cleanUserId = String(ownerUserId || (cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_owner')).trim();
+
+    if (!/^[a-zA-Z0-9_]{3,30}$/.test(cleanUserId)) {
+      throw Error('Owner User ID must be 3-30 alphanumeric characters or underscores');
+    }
+
+    // Check unique store code
+    const existingCode = await db.get('SELECT id FROM stores WHERE LOWER(code) = LOWER(?)', [cleanCode]);
+    if (existingCode) {
+      return r.status(400).json({ ok: false, error: `Store code '${cleanCode}' is already registered` });
+    }
+
+    // Check if user ID or email exists
+    const existingUser = await db.get(
+      'SELECT id FROM users WHERE LOWER(user_id) = LOWER(?) OR (email IS NOT NULL AND LOWER(email) = LOWER(?))',
+      [cleanUserId, cleanEmail]
+    );
+    if (existingUser) {
+      return r.status(400).json({ ok: false, error: 'User ID or Email is already registered' });
+    }
+
+    const storeId = `store_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const slug = (cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + cleanCode.toLowerCase()).replace(/^-+|-+$/g, '');
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = hash(password, salt);
+
+    // Create pending user (role=boss for legacy compatibility, effective_role=admin, requested_role=admin)
+    await db.run(`
+      INSERT INTO users (
+        user_id, password_hash, salt, display_name, role, active,
+        email, phone, approval_status, requested_role, effective_role,
+        organization, registration_reason, requested_at
+      ) VALUES (?, ?, ?, ?, 'boss', 0, ?, ?, 'pending', 'admin', 'admin', ?, ?, CURRENT_TIMESTAMP)
+    `, [
+      cleanUserId,
+      passwordHash,
+      salt,
+      cleanOwnerName,
+      cleanEmail,
+      phone ? String(phone).trim() : null,
+      cleanName,
+      applicationReason || `New store application for ${cleanName}`
+    ]);
+
+    // Create pending store
+    await db.run(`
+      INSERT INTO stores (
+        id, name, code, slug, store_type, status, owner_user_id, address, city, max_slots, rack_rows, rack_cols
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 50, 4, 4)
+    `, [
+      storeId,
+      cleanName,
+      cleanCode,
+      slug,
+      String(storeType || 'grocery').toLowerCase(),
+      cleanUserId,
+      address ? String(address).trim() : null,
+      city ? String(city).trim() : null
+    ]);
+
+    // Create pending membership
+    await db.run(`
+      INSERT INTO store_memberships (store_id, user_id, role, status)
+      VALUES (?, ?, 'store_owner', 'pending')
+    `, [storeId, cleanUserId]);
+
+    // Audit log
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'STORE_APPLICATION_SUBMITTED', 'store', ?, ?)
+    `, [storeId, cleanUserId, storeId, `Store application submitted for ${cleanName} (${cleanCode})`]).catch(() => {});
+
+    r.json({
+      ok: true,
+      storeId,
+      code: cleanCode,
+      message: 'Store registration request submitted successfully. Pending Platform Owner approval.'
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+};
+app.post('/api/stores/apply', handleStoreApply);
+app.post('/api/stores/register', handleStoreApply);
+
 // ---------------- HARDWARE ROUTES (ESP32 / Keypad) ----------------
 app.post('/api/hardware/store', hardwareAuth, async (q, r) => {
   try {
     const { slot, item, quantity = 1, source = 'keypad' } = q.body || {};
-    const updatedSlot = await handleMovement('STORE', slot, item, quantity, source, q.user);
-    r.json({ ok: true, message: 'Stock stored via hardware', slot: updatedSlot });
+    const updatedSlot = await handleMovement('STORE', slot, item, quantity, source, q.user, q.storeId);
+    r.json({ ok: true, message: 'Stock stored via hardware', slot: updatedSlot, storeId: q.storeId });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
@@ -1094,8 +1347,8 @@ app.post('/api/hardware/store', hardwareAuth, async (q, r) => {
 app.post('/api/hardware/retrieve', hardwareAuth, async (q, r) => {
   try {
     const { slot, item, quantity = 1, source = 'keypad' } = q.body || {};
-    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, source, q.user);
-    r.json({ ok: true, message: 'Stock retrieved via hardware', slot: updatedSlot });
+    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, source, q.user, q.storeId);
+    r.json({ ok: true, message: 'Stock retrieved via hardware', slot: updatedSlot, storeId: q.storeId });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
@@ -1104,25 +1357,28 @@ app.post('/api/hardware/retrieve', hardwareAuth, async (q, r) => {
 // ---------------- PROTECTED WEB DASHBOARD ROUTES ----------------
 app.use(authenticateUser);
 
-// Get all rack slots
-app.get('/slots', async (q, r) => {
+// Get all rack slots (Tenant Scoped)
+app.get('/slots', tenantContext, async (q, r) => {
   try {
-    const allSlots = await db.all("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots ORDER BY slot");
+    const allSlots = await db.all(
+      "SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, store_id, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE store_id = ? ORDER BY slot",
+      [q.storeId]
+    );
     r.json(allSlots);
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Get recent transactions with date filtering and role boundary enforcement
-app.get('/transactions', async (q, r) => {
+// Get recent transactions with date filtering and role boundary enforcement (Tenant Scoped)
+app.get('/transactions', tenantContext, async (q, r) => {
   try {
     const { from, to, startBound, endBound } = parseAndValidateDateRange(q.query.from, q.query.to);
-    const conditions = [];
-    const params = [];
+    const conditions = ['store_id = ?'];
+    const params = [q.storeId];
 
     // Operators only view their own transactions
-    if (q.user?.role === 'operator') {
+    if (q.user?.role === 'operator' || q.storeRole === 'operator') {
       conditions.push('user_id = ?');
       params.push(q.user.userId);
     }
@@ -1137,8 +1393,8 @@ app.get('/transactions', async (q, r) => {
       params.push(endBound);
     }
 
-    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id FROM transactions ${whereClause} ORDER BY id DESC LIMIT 1000`;
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id, store_id FROM transactions ${whereClause} ORDER BY id DESC LIMIT 1000`;
     const txs = await db.all(sql, params);
     r.json(txs);
   } catch (e) {
@@ -1147,14 +1403,14 @@ app.get('/transactions', async (q, r) => {
   }
 });
 
-// Download transactions as Excel (.xlsx) file
-app.get('/transactions/export', async (q, r) => {
+// Download transactions as Excel (.xlsx) file (Tenant Scoped)
+app.get('/transactions/export', tenantContext, async (q, r) => {
   try {
     const { from, to, startBound, endBound } = parseAndValidateDateRange(q.query.from, q.query.to);
-    const conditions = [];
-    const params = [];
+    const conditions = ['store_id = ?'];
+    const params = [q.storeId];
 
-    if (q.user?.role === 'operator') {
+    if (q.user?.role === 'operator' || q.storeRole === 'operator') {
       conditions.push('user_id = ?');
       params.push(q.user.userId);
     }
@@ -1167,12 +1423,12 @@ app.get('/transactions/export', async (q, r) => {
       params.push(endBound);
     }
 
-    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id FROM transactions ${whereClause} ORDER BY id DESC`;
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    const sql = `SELECT id, action, slot, item, item_name, sku, source, time, quantity, before_quantity, after_quantity, user_name, role, user_id, store_id FROM transactions ${whereClause} ORDER BY id DESC`;
     const txs = await db.all(sql, params);
 
     const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'ASRS Smart Warehouse';
+    workbook.creator = `ASRS - ${q.store?.name || 'Smart Warehouse'}`;
     workbook.created = new Date();
     const sheet = workbook.addWorksheet('Transactions');
 
@@ -1215,11 +1471,12 @@ app.get('/transactions/export', async (q, r) => {
       }
     }
 
+    const storePrefix = (q.storeId === 'store_default_001' || !q.store?.code) ? 'ASRS' : q.store.code.replace(/[^a-zA-Z0-9_-]/g, '');
     let filename;
-    if (from && to) filename = `ASRS_Transactions_${from}_to_${to}.xlsx`;
-    else if (from) filename = `ASRS_Transactions_from_${from}.xlsx`;
-    else if (to) filename = `ASRS_Transactions_to_${to}.xlsx`;
-    else filename = 'ASRS_Transactions_All.xlsx';
+    if (from && to) filename = `${storePrefix}_Transactions_${from}_to_${to}.xlsx`;
+    else if (from) filename = `${storePrefix}_Transactions_from_${from}.xlsx`;
+    else if (to) filename = `${storePrefix}_Transactions_to_${to}.xlsx`;
+    else filename = `${storePrefix}_Transactions_All.xlsx`;
 
     const buffer = await workbook.xlsx.writeBuffer();
     r.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1232,104 +1489,113 @@ app.get('/transactions/export', async (q, r) => {
   }
 });
 
-// Get warehouse summary stats
-app.get('/summary', async (q, r) => {
+// Get warehouse summary stats (Tenant Scoped)
+app.get('/summary', tenantContext, async (q, r) => {
   try {
-    const allSlots = await db.all('SELECT quantity, capacity FROM slots');
-    const storedRes = await db.get("SELECT COALESCE(SUM(quantity), 0) as n FROM transactions WHERE action='STORE'");
-    const retrievedRes = await db.get("SELECT COALESCE(SUM(quantity), 0) as n FROM transactions WHERE action='RETRIEVE'");
-    const rack = await db.get('SELECT rows, cols FROM rack_config WHERE id=1');
+    const allSlots = await db.all('SELECT quantity, capacity FROM slots WHERE store_id = ?', [q.storeId]);
+    const storedRes = await db.get("SELECT COALESCE(SUM(quantity), 0) as n FROM transactions WHERE store_id = ? AND action='STORE'", [q.storeId]);
+    const retrievedRes = await db.get("SELECT COALESCE(SUM(quantity), 0) as n FROM transactions WHERE store_id = ? AND action='RETRIEVE'", [q.storeId]);
+    let rack = null;
+    if (q.storeId === 'store_default_001') {
+      rack = await db.get('SELECT rows, cols FROM rack_config WHERE store_id = ? OR id = 1 ORDER BY id DESC LIMIT 1', [q.storeId]);
+    }
 
     const inventory = allSlots.reduce((a, s) => a + Number(s.quantity || 0), 0);
     const occupiedSlots = allSlots.filter(s => Number(s.quantity || 0) > 0).length;
     const freeCapacity = allSlots.reduce((a, s) => a + Math.max(0, Number(s.capacity || 10) - Number(s.quantity || 0)), 0);
 
     r.json({
+      storeId: q.storeId,
+      storeName: q.store?.name || 'Warehouse',
       inventory,
       stored: Number(storedRes?.n || 0),
       retrieved: Number(retrievedRes?.n || 0),
       occupiedSlots,
       totalSlots: allSlots.length,
       freeCapacity,
-      rack: rack || { rows: 4, cols: 4 }
+      rack: rack || { rows: q.store?.rack_rows || 4, cols: q.store?.rack_cols || 4 }
     });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Web Store & Retrieve (Operator only)
-app.post('/store', operatorOnly, async (q, r) => {
+// Web Store & Retrieve (Operator only, Tenant Scoped)
+app.post('/store', tenantContext, storeOperatorOnly, async (q, r) => {
   try {
     const { slot, item, quantity = 1 } = q.body || {};
-    const updatedSlot = await handleMovement('STORE', slot, item, quantity, 'dashboard_operator_simulated', q.user);
+    const updatedSlot = await handleMovement('STORE', slot, item, quantity, 'dashboard_operator_simulated', q.user, q.storeId);
     r.json({ ok: true, slot: updatedSlot });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/retrieve', operatorOnly, async (q, r) => {
+app.post('/retrieve', tenantContext, storeOperatorOnly, async (q, r) => {
   try {
     const { slot, item, quantity = 1 } = q.body || {};
-    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, 'dashboard_operator_simulated', q.user);
+    const updatedSlot = await handleMovement('RETRIEVE', slot, item, quantity, 'dashboard_operator_simulated', q.user, q.storeId);
     r.json({ ok: true, slot: updatedSlot });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Update product name & SKU (Admin & Owner)
-app.put('/slots/:slot/product', adminOnly, async (q, r) => {
+// Update product name & SKU (Store Admin & Owner, Tenant Scoped)
+app.put('/slots/:slot/product', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const code = String(q.params.slot).toUpperCase();
-    const s = await db.get('SELECT * FROM slots WHERE slot=?', [code]);
-    if (!s) throw Error('Slot not found');
+    const s = await db.get('SELECT * FROM slots WHERE store_id = ? AND slot = ?', [q.storeId, code]);
+    if (!s) throw Error('Slot not found in this store');
     const { item_name, sku } = q.body || {};
     if (!String(item_name || '').trim() || !String(sku || '').trim()) {
       throw Error('Product name and SKU are required');
     }
-    await db.run('UPDATE slots SET item_name=?, sku=? WHERE slot=?', [
+    await db.run('UPDATE slots SET item_name = ?, sku = ? WHERE store_id = ? AND slot = ?', [
       String(item_name).trim(),
       String(sku).trim(),
+      q.storeId,
       code
     ]);
-    const updated = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE slot=?", [code]);
+    const updated = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, store_id, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE store_id = ? AND slot = ?", [q.storeId, code]);
     r.json({ ok: true, slot: updated });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Update slot capacity (Owner only)
-app.put('/slots/:slot/capacity', ownerOnly, async (q, r) => {
+// Update slot capacity (Store Owner only, Tenant Scoped)
+app.put('/slots/:slot/capacity', tenantContext, storeOwnerOnly, async (q, r) => {
   try {
     const code = String(q.params.slot).toUpperCase();
-    const s = await db.get('SELECT * FROM slots WHERE slot=?', [code]);
-    if (!s) throw Error('Slot not found');
+    const s = await db.get('SELECT * FROM slots WHERE store_id = ? AND slot = ?', [q.storeId, code]);
+    if (!s) throw Error('Slot not found in this store');
     const cap = Number((q.body || {}).capacity);
     if (!Number.isInteger(cap) || cap < 1 || cap < Number(s.quantity || 0)) {
       throw Error('Capacity must be a positive whole number at least as large as current stock');
     }
-    await db.run('UPDATE slots SET capacity=? WHERE slot=?', [cap, code]);
-    const updated = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE slot=?", [code]);
+    await db.run('UPDATE slots SET capacity = ? WHERE store_id = ? AND slot = ?', [cap, q.storeId, code]);
+    const updated = await db.get("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, store_id, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE store_id = ? AND slot = ?", [q.storeId, code]);
     r.json({ ok: true, slot: updated });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Dynamic Rack Size Configuration (Boss only)
-app.get('/rack/config', async (q, r) => {
+// Dynamic Rack Size Configuration (Tenant Scoped - SEC-03 enforced)
+app.get('/rack/config', tenantContext, async (q, r) => {
   try {
-    const config = await db.get('SELECT rows, cols FROM rack_config WHERE id=1');
-    r.json(config || { rows: 4, cols: 4 });
+    let config = null;
+    if (q.storeId === 'store_default_001') {
+      config = await db.get('SELECT rows, cols FROM rack_config WHERE store_id = ? OR id = 1 ORDER BY id DESC LIMIT 1', [q.storeId]);
+    }
+    r.json(config || { rows: q.store?.rack_rows || 4, cols: q.store?.rack_cols || 4 });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.put('/rack/dimensions', ownerOnly, async (q, r) => {
+app.put('/rack/dimensions', tenantContext, storeOwnerOnly, async (q, r) => {
   try {
     const newRows = Number(q.body.rows);
     const newCols = Number(q.body.cols);
@@ -1349,7 +1615,7 @@ app.put('/rack/dimensions', ownerOnly, async (q, r) => {
       }
     }
 
-    const currentSlots = await db.all('SELECT slot, quantity, item_name FROM slots');
+    const currentSlots = await db.all('SELECT slot, quantity, item_name FROM slots WHERE store_id = ?', [q.storeId]);
     const outOfBoundsOccupied = currentSlots.filter(s => !validSlotSet.has(s.slot) && Number(s.quantity || 0) > 0);
 
     // Prevent data loss if any shrinking slot is occupied
@@ -1358,15 +1624,15 @@ app.put('/rack/dimensions', ownerOnly, async (q, r) => {
       throw Error(`Cannot shrink rack. The following slots contain stock: ${list}. Please retrieve or move items first.`);
     }
 
-    // Safe to delete out of bounds empty slots
+    // Safe to delete out of bounds empty slots for this store
     const outOfBoundsEmpty = currentSlots.filter(s => !validSlotSet.has(s.slot));
     for (const s of outOfBoundsEmpty) {
-      await db.run('DELETE FROM slots WHERE slot=?', [s.slot]);
+      await db.run('DELETE FROM slots WHERE store_id = ? AND slot = ?', [q.storeId, s.slot]);
     }
 
-    // Add any newly created slots
+    // Add any newly created slots for this store
     const existingSlotMap = new Map(currentSlots.map(s => [s.slot, s]));
-    let maxItemRes = await db.get('SELECT COALESCE(MAX(item), 0) as m FROM slots');
+    let maxItemRes = await db.get('SELECT COALESCE(MAX(item), 0) as m FROM slots WHERE store_id = ?', [q.storeId]);
     let nextItemNum = Number(maxItemRes?.m || 0) + 1;
 
     for (let rowIdx = 0; rowIdx < newRows; rowIdx++) {
@@ -1375,9 +1641,10 @@ app.put('/rack/dimensions', ownerOnly, async (q, r) => {
         const slotCode = `${rowLetter}${colIdx}`;
         if (!existingSlotMap.has(slotCode)) {
           await db.run(`
-            INSERT INTO slots (slot, item, x, y, occupied, quantity, capacity, item_name, sku)
-            VALUES (?, ?, ?, ?, 0, 0, 10, ?, ?)
+            INSERT INTO slots (store_id, slot, item, x, y, occupied, quantity, capacity, item_name, sku)
+            VALUES (?, ?, ?, ?, ?, 0, 0, 10, ?, ?)
           `, [
+            q.storeId,
             slotCode,
             nextItemNum,
             (colIdx - 1) * 100,
@@ -1390,17 +1657,20 @@ app.put('/rack/dimensions', ownerOnly, async (q, r) => {
       }
     }
 
-    await db.run('UPDATE rack_config SET rows=?, cols=?, updated_at=CURRENT_TIMESTAMP WHERE id=1', [newRows, newCols]);
-    const updatedSlots = await db.all("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots ORDER BY slot");
+    if (q.storeId === 'store_default_001') {
+      await db.run('UPDATE rack_config SET rows = ?, cols = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [newRows, newCols]);
+    }
+    await db.run('UPDATE stores SET rack_rows = ?, rack_cols = ? WHERE id = ?', [newRows, newCols, q.storeId]);
+    const updatedSlots = await db.all("SELECT slot, item, item_name, sku, x, y, occupied, quantity, capacity, store_id, CASE WHEN quantity<=0 THEN 'EMPTY' WHEN quantity>=capacity THEN 'FULL' ELSE 'AVAILABLE' END status FROM slots WHERE store_id = ? ORDER BY slot", [q.storeId]);
 
-    r.json({ ok: true, rows: newRows, cols: newCols, totalSlots: updatedSlots.length });
+    r.json({ ok: true, rows: newRows, cols: newCols, totalSlots: updatedSlots.length, storeId: q.storeId });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Hardware API Key Management (Owner only)
-app.get('/hardware/key', ownerOnly, async (q, r) => {
+// Hardware API Key Management (Platform Owner only - SEC-04)
+app.get('/hardware/key', platformOwnerOnly, async (q, r) => {
   try {
     const keyRow = await db.get("SELECT value FROM system_settings WHERE key='hardware_api_key'");
     r.json({ ok: true, hardwareApiKey: keyRow?.value || '' });
@@ -1409,19 +1679,25 @@ app.get('/hardware/key', ownerOnly, async (q, r) => {
   }
 });
 
-app.post('/hardware/key/regenerate', ownerOnly, async (q, r) => {
+app.post('/hardware/key/regenerate', platformOwnerOnly, async (q, r) => {
   try {
     const newKey = 'asrs_hw_' + crypto.randomBytes(16).toString('hex');
     await db.run("UPDATE system_settings SET value=? WHERE key='hardware_api_key'", [newKey]);
+    const dev = await db.get("SELECT id FROM store_devices WHERE store_id = 'store_default_001'");
+    if (dev) {
+      await db.run("UPDATE store_devices SET device_key = ? WHERE id = ?", [newKey, dev.id]);
+    } else {
+      await db.run("INSERT INTO store_devices (store_id, device_key, device_name, status) VALUES ('store_default_001', ?, 'Main ESP32 Controller', 'active')", [newKey]);
+    }
     r.json({ ok: true, hardwareApiKey: newKey });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------------- APPROVAL QUEUE ROUTES ----------------
-// Owner-only Admin Request Approval Queue
-app.get('/api/owner/pending-admins', ownerOnly, async (q, r) => {
+// ---------------- APPROVAL QUEUE ROUTES (SEC-02) ----------------
+// Platform Owner-only Admin Request Approval Queue
+app.get('/api/owner/pending-admins', platformOwnerOnly, async (q, r) => {
   try {
     const list = await db.all(`
       SELECT id, user_id, display_name, email, phone, organization, registration_reason, requested_at, approval_status
@@ -1435,7 +1711,7 @@ app.get('/api/owner/pending-admins', ownerOnly, async (q, r) => {
   }
 });
 
-app.post('/api/owner/admins/:id/approve', ownerOnly, async (q, r) => {
+app.post('/api/owner/admins/:id/approve', platformOwnerOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'admin'", [id]);
@@ -1450,13 +1726,21 @@ app.post('/api/owner/admins/:id/approve', ownerOnly, async (q, r) => {
       WHERE id = ?
     `, [q.user.userId, id]);
 
+    // Ensure store membership in default store
+    const existingM = await db.get("SELECT id FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = ?", [target.user_id]);
+    if (existingM) {
+      await db.run("UPDATE store_memberships SET status = 'active', role = 'store_admin' WHERE id = ?", [existingM.id]);
+    } else {
+      await db.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', ?, 'store_admin', 'active')", [target.user_id]);
+    }
+
     r.json({ ok: true, message: `Admin account '${target.user_id}' has been approved and activated.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/owner/admins/:id/reject', ownerOnly, async (q, r) => {
+app.post('/api/owner/admins/:id/reject', platformOwnerOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const { rejectionReason } = q.body || {};
@@ -1472,6 +1756,9 @@ app.post('/api/owner/admins/:id/reject', ownerOnly, async (q, r) => {
       WHERE id = ?
     `, [q.user.userId, String(rejectionReason || 'Request rejected by Owner').trim(), id]);
 
+    // Deactivate membership if any
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE user_id = ?", [target.user_id]);
+
     // Purge any sessions
     await db.run('DELETE FROM user_sessions WHERE user_id = ?', [target.user_id]);
 
@@ -1481,8 +1768,8 @@ app.post('/api/owner/admins/:id/reject', ownerOnly, async (q, r) => {
   }
 });
 
-// Admin/Owner Operator Request Approval Queue
-app.get('/api/admin/pending-operators', adminOnly, async (q, r) => {
+// Admin/Owner Operator Request Approval Queue (Tenant Scoped)
+app.get('/api/admin/pending-operators', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const list = await db.all(`
       SELECT id, user_id, display_name, email, phone, employee_id, registration_reason, requested_at, approval_status
@@ -1496,7 +1783,7 @@ app.get('/api/admin/pending-operators', adminOnly, async (q, r) => {
   }
 });
 
-app.post('/api/admin/operators/:id/approve', adminOnly, async (q, r) => {
+app.post('/api/admin/operators/:id/approve', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const target = await db.get("SELECT * FROM users WHERE id = ? AND requested_role = 'operator'", [id]);
@@ -1511,13 +1798,21 @@ app.post('/api/admin/operators/:id/approve', adminOnly, async (q, r) => {
       WHERE id = ?
     `, [q.user.userId, id]);
 
+    // Ensure store membership is created/activated for this operator in caller's store
+    const existingM = await db.get("SELECT id FROM store_memberships WHERE store_id = ? AND user_id = ?", [q.storeId, target.user_id]);
+    if (existingM) {
+      await db.run("UPDATE store_memberships SET status = 'active', role = 'operator' WHERE id = ?", [existingM.id]);
+    } else {
+      await db.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES (?, ?, 'operator', 'active')", [q.storeId, target.user_id]);
+    }
+
     r.json({ ok: true, message: `Operator account '${target.user_id}' has been approved and activated.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/admin/operators/:id/reject', adminOnly, async (q, r) => {
+app.post('/api/admin/operators/:id/reject', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const { rejectionReason } = q.body || {};
@@ -1533,6 +1828,9 @@ app.post('/api/admin/operators/:id/reject', adminOnly, async (q, r) => {
       WHERE id = ?
     `, [q.user.userId, String(rejectionReason || 'Request rejected by Administrator').trim(), id]);
 
+    // Deactivate membership in this store if any
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, target.user_id]);
+
     // Purge any sessions
     await db.run('DELETE FROM user_sessions WHERE user_id = ?', [target.user_id]);
 
@@ -1542,24 +1840,25 @@ app.post('/api/admin/operators/:id/reject', adminOnly, async (q, r) => {
   }
 });
 
-// Owner Admin Management
-app.get('/api/owner/admins', ownerOnly, async (q, r) => {
+// Store Owner Admin Management (Tenant Scoped - SEC-02)
+app.get('/api/owner/admins', tenantContext, storeOwnerOnly, async (q, r) => {
   try {
     const admins = await db.all(`
-      SELECT id, user_id, display_name, email, phone, organization, employee_id, active,
-             approval_status, requested_at, reviewed_at, reviewed_by, created_at, role, effective_role, requested_role
-      FROM users
-      WHERE (effective_role = 'admin' OR (requested_role = 'admin' AND role = 'boss'))
-        AND approval_status = 'approved'
-      ORDER BY id DESC
-    `);
+      SELECT u.id, u.user_id, u.display_name, u.email, u.phone, u.organization, u.employee_id, u.active,
+             u.approval_status, u.requested_at, u.reviewed_at, u.reviewed_by, u.created_at, u.role, u.effective_role, u.requested_role
+      FROM store_memberships m
+      JOIN users u ON m.user_id = u.user_id
+      WHERE m.store_id = ? AND (m.role = 'store_admin' OR u.effective_role = 'admin' OR (u.requested_role = 'admin' AND u.role = 'boss'))
+        AND u.approval_status = 'approved'
+      ORDER BY u.id DESC
+    `, [q.storeId]);
     r.json({ ok: true, admins: admins.map(safeUser) });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/owner/admins/:id/deactivate', ownerOnly, async (q, r) => {
+app.post('/api/owner/admins/:id/deactivate', tenantContext, storeOwnerOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
@@ -1568,11 +1867,16 @@ app.post('/api/owner/admins/:id/deactivate', ownerOnly, async (q, r) => {
     if (u.user_id === 'testboss' || targetRole === 'owner') {
       return r.status(400).json({ ok: false, error: 'Cannot deactivate the Owner account' });
     }
-    if (targetRole !== 'admin') {
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    if (!mem) {
+      return r.status(404).json({ ok: false, error: 'Admin account not found in this store' });
+    }
+    if (targetRole !== 'admin' && mem.role !== 'store_admin') {
       return r.status(400).json({ ok: false, error: 'Target user is not an administrator' });
     }
 
     await db.run('UPDATE users SET active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
     await db.run('DELETE FROM user_sessions WHERE user_id = ?', [u.user_id]);
     r.json({ ok: true, message: `Admin '${u.user_id}' has been deactivated. All active sessions have been revoked.` });
   } catch (e) {
@@ -1580,41 +1884,47 @@ app.post('/api/owner/admins/:id/deactivate', ownerOnly, async (q, r) => {
   }
 });
 
-app.post('/api/owner/admins/:id/activate', ownerOnly, async (q, r) => {
+app.post('/api/owner/admins/:id/activate', tenantContext, storeOwnerOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
     if (!u) return r.status(404).json({ ok: false, error: 'Admin account not found' });
     const targetRole = getUserRole(u);
-    if (targetRole !== 'admin') {
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    if (!mem) {
+      return r.status(404).json({ ok: false, error: 'Admin account not found in this store' });
+    }
+    if (targetRole !== 'admin' && mem.role !== 'store_admin') {
       return r.status(400).json({ ok: false, error: 'Target user is not an administrator' });
     }
 
     await db.run('UPDATE users SET active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
     r.json({ ok: true, message: `Admin '${u.user_id}' has been activated.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Admin Operator Management
-app.get('/api/admin/operators', adminOnly, async (q, r) => {
+// Admin Operator Management (Tenant Scoped - SEC-02)
+app.get('/api/admin/operators', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const operators = await db.all(`
-      SELECT id, user_id, display_name, email, phone, organization, employee_id, active,
-             approval_status, requested_at, reviewed_at, reviewed_by, created_at, role, effective_role, requested_role
-      FROM users
-      WHERE (role = 'operator' OR effective_role = 'operator')
-        AND approval_status = 'approved'
-      ORDER BY id DESC
-    `);
+      SELECT u.id, u.user_id, u.display_name, u.email, u.phone, u.organization, u.employee_id, u.active,
+             u.approval_status, u.requested_at, u.reviewed_at, u.reviewed_by, u.created_at, u.role, u.effective_role, u.requested_role
+      FROM store_memberships m
+      JOIN users u ON m.user_id = u.user_id
+      WHERE m.store_id = ? AND (m.role = 'operator' OR u.role = 'operator' OR u.effective_role = 'operator')
+        AND u.approval_status = 'approved'
+      ORDER BY u.id DESC
+    `, [q.storeId]);
     r.json({ ok: true, operators: operators.map(safeUser) });
   } catch (e) {
     r.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/admin/operators/:id/deactivate', adminOnly, async (q, r) => {
+app.post('/api/admin/operators/:id/deactivate', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
@@ -1623,8 +1933,13 @@ app.post('/api/admin/operators/:id/deactivate', adminOnly, async (q, r) => {
     if (targetRole !== 'operator') {
       return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
     }
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    if (!mem) {
+      return r.status(404).json({ ok: false, error: 'Operator account not found in this store' });
+    }
 
     await db.run('UPDATE users SET active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
     await db.run('DELETE FROM user_sessions WHERE user_id = ?', [u.user_id]);
     r.json({ ok: true, message: `Operator '${u.user_id}' has been deactivated. All active sessions have been revoked.` });
   } catch (e) {
@@ -1632,7 +1947,7 @@ app.post('/api/admin/operators/:id/deactivate', adminOnly, async (q, r) => {
   }
 });
 
-app.post('/api/admin/operators/:id/activate', adminOnly, async (q, r) => {
+app.post('/api/admin/operators/:id/activate', tenantContext, storeAdminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id = ?', [id]);
@@ -1641,23 +1956,45 @@ app.post('/api/admin/operators/:id/activate', adminOnly, async (q, r) => {
     if (targetRole !== 'operator') {
       return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
     }
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    if (!mem) {
+      return r.status(404).json({ ok: false, error: 'Operator account not found in this store' });
+    }
 
     await db.run('UPDATE users SET active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
+    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
     r.json({ ok: true, message: `Operator '${u.user_id}' has been activated.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// User Management (Admin & Owner)
-app.get('/users', adminOnly, async (q, r) => {
+// User Management (Admin & Owner - Tenant Scoped SEC-02)
+app.get('/users', tenantContext, adminOnly, async (q, r) => {
   try {
+    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
     let users;
-    if (['owner', 'boss'].includes(q.user.role)) {
-      users = await db.all('SELECT id, user_id, display_name, role, effective_role, requested_role, active, approval_status, email, phone, employee_id, organization, created_at, requested_at, reviewed_at, reviewed_by FROM users ORDER BY id');
+    if (isOwner) {
+      users = await db.all(`
+        SELECT u.id, u.user_id, u.display_name, u.role, u.effective_role, u.requested_role, u.active,
+               u.approval_status, u.email, u.phone, u.employee_id, u.organization, u.created_at,
+               u.requested_at, u.reviewed_at, u.reviewed_by
+        FROM store_memberships m
+        JOIN users u ON m.user_id = u.user_id
+        WHERE m.store_id = ?
+        ORDER BY u.id
+      `, [q.storeId]);
     } else {
-      // Admins only see operators
-      users = await db.all("SELECT id, user_id, display_name, role, effective_role, requested_role, active, approval_status, email, phone, employee_id, organization, created_at, requested_at, reviewed_at, reviewed_by FROM users WHERE role = 'operator' OR effective_role = 'operator' ORDER BY id");
+      // Admins only see operators in their store
+      users = await db.all(`
+        SELECT u.id, u.user_id, u.display_name, u.role, u.effective_role, u.requested_role, u.active,
+               u.approval_status, u.email, u.phone, u.employee_id, u.organization, u.created_at,
+               u.requested_at, u.reviewed_at, u.reviewed_by
+        FROM store_memberships m
+        JOIN users u ON m.user_id = u.user_id
+        WHERE m.store_id = ? AND (m.role = 'operator' OR u.role = 'operator' OR u.effective_role = 'operator')
+        ORDER BY u.id
+      `, [q.storeId]);
     }
     const safeList = users.map(u => ({
       ...safeUser(u),
@@ -1670,7 +2007,7 @@ app.get('/users', adminOnly, async (q, r) => {
   }
 });
 
-app.post('/users', adminOnly, async (q, r) => {
+app.post('/users', tenantContext, adminOnly, async (q, r) => {
   try {
     const { userId, password, displayName, role = 'operator', email, phone, employeeId, organization } = q.body || {};
     if (!userId || !password || password.length < 8 || !displayName) {
@@ -1682,7 +2019,9 @@ app.post('/users', adminOnly, async (q, r) => {
     }
 
     const targetRole = String(role).toLowerCase();
-    if (targetRole === 'admin' && !['owner', 'boss'].includes(q.user.role)) {
+    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+
+    if (targetRole === 'admin' && !isOwner) {
       return r.status(403).json({ ok: false, error: 'Only Owner can create Admin accounts' });
     }
     if (targetRole === 'owner') {
@@ -1697,6 +2036,7 @@ app.post('/users', adminOnly, async (q, r) => {
     const salt = crypto.randomBytes(16).toString('hex');
     const dbRole = targetRole === 'admin' ? 'boss' : 'operator';
     const effectiveRole = targetRole === 'admin' ? 'admin' : 'operator';
+    const membershipRole = targetRole === 'admin' ? 'store_admin' : 'operator';
 
     await db.run(`
       INSERT INTO users (
@@ -1719,13 +2059,18 @@ app.post('/users', adminOnly, async (q, r) => {
       q.user.userId
     ]);
 
+    await db.run(
+      "INSERT INTO store_memberships (store_id, user_id, role, status) VALUES (?, ?, ?, 'active')",
+      [q.storeId, cleanId, membershipRole]
+    );
+
     r.json({ ok: true });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-app.patch('/users/:id', adminOnly, async (q, r) => {
+app.patch('/users/:id', tenantContext, adminOnly, async (q, r) => {
   try {
     const id = Number(q.params.id);
     const u = await db.get('SELECT * FROM users WHERE id=?', [id]);
@@ -1738,8 +2083,16 @@ app.patch('/users/:id', adminOnly, async (q, r) => {
       return r.status(403).json({ ok: false, error: 'Cannot modify Owner account via this endpoint' });
     }
 
+    // Must be member of caller's store
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    if (!mem) {
+      return r.status(404).json({ ok: false, error: 'User not found in this store' });
+    }
+
+    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+
     // Admins can ONLY modify operators
-    if (!['owner', 'boss'].includes(q.user.role) && targetRole !== 'operator') {
+    if (!isOwner && targetRole !== 'operator' && mem.role !== 'operator') {
       return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
     }
 
@@ -1749,7 +2102,7 @@ app.patch('/users/:id', adminOnly, async (q, r) => {
     }
     if (active !== undefined) {
       const activeVal = active ? 1 : 0;
-      if (activeVal === 0 && u.user_id === q.user.userId && ['owner', 'boss'].includes(q.user.role)) {
+      if (activeVal === 0 && u.user_id === q.user.userId && isOwner) {
         const ownerCount = await db.get("SELECT COUNT(*) as n FROM users WHERE (user_id='testboss' OR role='boss' OR effective_role='owner') AND active=1 AND id != ?", [id]);
         if (Number(ownerCount?.n || 0) === 0) {
           return r.status(400).json({ ok: false, error: 'Cannot deactivate the only active Owner account' });
@@ -1757,14 +2110,18 @@ app.patch('/users/:id', adminOnly, async (q, r) => {
       }
       await db.run('UPDATE users SET active=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [activeVal, q.user.userId, id]);
       if (activeVal === 0) {
+        await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
         // Immediate session revocation on deactivation!
         await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
+      } else {
+        await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
       }
     }
     if (approvalStatus !== undefined) {
-      if (['owner', 'boss'].includes(q.user.role) || targetRole === 'operator') {
+      if (isOwner || targetRole === 'operator') {
         await db.run('UPDATE users SET approval_status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [approvalStatus, q.user.userId, id]);
         if (approvalStatus !== 'approved') {
+          await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
           await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
         }
       }
@@ -1778,6 +2135,525 @@ app.patch('/users/:id', adminOnly, async (q, r) => {
     }
 
     r.json({ ok: true });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// =========================================================================
+// MULTI-TENANT SAAS: PLATFORM OWNER, STORE MANAGEMENT, STAFF & DEVICES
+// =========================================================================
+
+// User Active Stores List
+app.get('/api/user/stores', async (q, r) => {
+  try {
+    const isPlatformOwner = q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    let stores;
+    if (isPlatformOwner) {
+      stores = await db.all(`
+        SELECT id, name, code, slug, store_type, status, rack_rows, rack_cols, 'platform_owner' as role
+        FROM stores
+        ORDER BY name ASC
+      `);
+    } else {
+      stores = await db.all(`
+        SELECT s.id, s.name, s.code, s.slug, s.store_type, s.status, s.rack_rows, s.rack_cols, m.role
+        FROM store_memberships m
+        JOIN stores s ON m.store_id = s.id
+        WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active'
+        ORDER BY s.name ASC
+      `, [q.user.userId]);
+    }
+    r.json({ ok: true, stores });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: List all stores across the platform
+app.get('/api/platform/stores', platformOwnerOnly, async (q, r) => {
+  try {
+    const stores = await db.all(`
+      SELECT s.*,
+             (SELECT COUNT(*) FROM store_memberships m WHERE m.store_id = s.id AND m.status = 'active') as active_members_count,
+             (SELECT COUNT(*) FROM slots sl WHERE sl.store_id = s.id) as slot_count
+      FROM stores s
+      ORDER BY s.created_at DESC
+    `);
+    r.json({ ok: true, stores });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: List pending store registration applications
+app.get('/api/platform/pending-stores', platformOwnerOnly, async (q, r) => {
+  try {
+    const pending = await db.all(`
+      SELECT s.*, u.display_name as owner_name, u.email as owner_email, u.phone as owner_phone, u.requested_at
+      FROM stores s
+      LEFT JOIN users u ON s.owner_user_id = u.user_id
+      WHERE s.status = 'pending'
+      ORDER BY s.created_at ASC
+    `);
+    r.json({ ok: true, stores: pending });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: Approve a store registration application
+app.post('/api/platform/stores/:id/approve', platformOwnerOnly, async (q, r) => {
+  try {
+    const storeId = q.params.id;
+    const store = await db.get('SELECT * FROM stores WHERE id = ?', [storeId]);
+    if (!store) return r.status(404).json({ ok: false, error: 'Store not found' });
+    if (store.status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Store is already marked as ${store.status}` });
+    }
+
+    // 1. Activate store
+    await db.run('UPDATE stores SET status = ? WHERE id = ?', ['active', storeId]);
+
+    // 2. Activate store owner membership
+    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [storeId, store.owner_user_id]);
+
+    // 3. Activate store owner user account
+    await db.run(`
+      UPDATE users
+      SET active = 1, approval_status = 'approved', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+      WHERE user_id = ?
+    `, [q.user.userId, store.owner_user_id]);
+
+    // 4. Initialize default rack slots (A1-D4) if none exist
+    const slotCount = await db.get('SELECT COUNT(*) as n FROM slots WHERE store_id = ?', [storeId]);
+    if (Number(slotCount?.n || 0) === 0) {
+      let itemNum = 1;
+      for (let rowIdx = 0; rowIdx < 4; rowIdx++) {
+        const rowLetter = String.fromCharCode(65 + rowIdx);
+        for (let colIdx = 1; colIdx <= 4; colIdx++) {
+          const slotCode = `${rowLetter}${colIdx}`;
+          await db.run(`
+            INSERT INTO slots (store_id, slot, item, x, y, occupied, quantity, capacity, item_name, sku)
+            VALUES (?, ?, ?, ?, ?, 0, 0, 10, ?, ?)
+          `, [
+            storeId,
+            slotCode,
+            itemNum,
+            (colIdx - 1) * 100,
+            rowIdx * 100,
+            `${store.name} ${slotCode}`,
+            `${store.code}-${slotCode}`
+          ]);
+          itemNum++;
+        }
+      }
+    }
+
+    // 5. Generate default store hardware device
+    const existingDev = await db.get('SELECT id FROM store_devices WHERE store_id = ?', [storeId]);
+    let deviceKey = '';
+    if (!existingDev) {
+      deviceKey = 'asrs_hw_' + crypto.randomBytes(16).toString('hex');
+      await db.run(`
+        INSERT INTO store_devices (store_id, device_key, device_name, status)
+        VALUES (?, ?, 'Primary ESP32 Controller', 'active')
+      `, [storeId, deviceKey]);
+    }
+
+    // 6. Audit log
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'STORE_APPROVED', 'store', ?, ?)
+    `, [storeId, q.user.userId, storeId, `Store '${store.name}' approved and activated`]).catch(() => {});
+
+    r.json({
+      ok: true,
+      message: `Store '${store.name}' has been approved and activated.`,
+      storeId,
+      deviceKey: deviceKey || undefined
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: Reject a store registration application
+app.post('/api/platform/stores/:id/reject', platformOwnerOnly, async (q, r) => {
+  try {
+    const storeId = q.params.id;
+    const { rejectionReason } = q.body || {};
+    const store = await db.get('SELECT * FROM stores WHERE id = ?', [storeId]);
+    if (!store) return r.status(404).json({ ok: false, error: 'Store not found' });
+    if (store.status !== 'pending') {
+      return r.status(400).json({ ok: false, error: `Store is already marked as ${store.status}` });
+    }
+
+    await db.run('UPDATE stores SET status = ? WHERE id = ?', ['rejected', storeId]);
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ?", [storeId]);
+    await db.run(`
+      UPDATE users
+      SET approval_status = 'rejected', active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?, rejection_reason = ?
+      WHERE user_id = ?
+    `, [q.user.userId, String(rejectionReason || 'Store application rejected by Platform Owner').trim(), store.owner_user_id]);
+
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [store.owner_user_id]);
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'STORE_REJECTED', 'store', ?, ?)
+    `, [storeId, q.user.userId, storeId, `Store application rejected: ${rejectionReason || 'No reason specified'}`]).catch(() => {});
+
+    r.json({ ok: true, message: `Store '${store.name}' application rejected.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: Suspend an active store
+app.post('/api/platform/stores/:id/suspend', platformOwnerOnly, async (q, r) => {
+  try {
+    const storeId = q.params.id;
+    if (storeId === 'store_default_001') {
+      return r.status(400).json({ ok: false, error: 'Cannot suspend the default warehouse store' });
+    }
+    const store = await db.get('SELECT * FROM stores WHERE id = ?', [storeId]);
+    if (!store) return r.status(404).json({ ok: false, error: 'Store not found' });
+
+    await db.run('UPDATE stores SET status = ? WHERE id = ?', ['suspended', storeId]);
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'STORE_SUSPENDED', 'store', ?, ?)
+    `, [storeId, q.user.userId, storeId, `Store '${store.name}' suspended by Platform Owner`]).catch(() => {});
+
+    r.json({ ok: true, message: `Store '${store.name}' has been suspended.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Platform Owner: Reactivate a suspended store
+app.post('/api/platform/stores/:id/activate', platformOwnerOnly, async (q, r) => {
+  try {
+    const storeId = q.params.id;
+    const store = await db.get('SELECT * FROM stores WHERE id = ?', [storeId]);
+    if (!store) return r.status(404).json({ ok: false, error: 'Store not found' });
+
+    await db.run('UPDATE stores SET status = ? WHERE id = ?', ['active', storeId]);
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'STORE_ACTIVATED', 'store', ?, ?)
+    `, [storeId, q.user.userId, storeId, `Store '${store.name}' activated by Platform Owner`]).catch(() => {});
+
+    r.json({ ok: true, message: `Store '${store.name}' has been activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Staff: List store members (Hierarchy: Operator=403, Admin=Operators only, Owner=All)
+app.get('/api/stores/:storeId/members', tenantContext, async (q, r) => {
+  try {
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isAdmin = q.storeRole === 'store_admin';
+
+    if (!isOwnerOrPlatform && !isAdmin) {
+      return r.status(403).json({ ok: false, error: 'Operators cannot view or manage store staff' });
+    }
+
+    let members;
+    if (isOwnerOrPlatform) {
+      members = await db.all(`
+        SELECT m.id, m.store_id, m.user_id, m.role, m.status, m.created_at,
+               u.display_name, u.email, u.phone, u.employee_id, u.active
+        FROM store_memberships m
+        JOIN users u ON m.user_id = u.user_id
+        WHERE m.store_id = ?
+        ORDER BY m.id DESC
+      `, [q.storeId]);
+    } else {
+      // Store Admins only see Operators
+      members = await db.all(`
+        SELECT m.id, m.store_id, m.user_id, m.role, m.status, m.created_at,
+               u.display_name, u.email, u.phone, u.employee_id, u.active
+        FROM store_memberships m
+        JOIN users u ON m.user_id = u.user_id
+        WHERE m.store_id = ? AND m.role = 'operator'
+        ORDER BY m.id DESC
+      `, [q.storeId]);
+    }
+
+    r.json({ ok: true, members });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Staff: Add new staff member or link existing user to store
+app.post('/api/stores/:storeId/members', tenantContext, async (q, r) => {
+  try {
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isAdmin = q.storeRole === 'store_admin';
+
+    if (!isOwnerOrPlatform && !isAdmin) {
+      return r.status(403).json({ ok: false, error: 'Operators cannot view or manage store staff' });
+    }
+
+    const {
+      userId,
+      role = 'operator',
+      displayName,
+      password,
+      email,
+      phone,
+      employeeId
+    } = q.body || {};
+
+    const cleanUserId = String(userId || '').trim();
+    if (!cleanUserId || !/^[a-zA-Z0-9_]{3,30}$/.test(cleanUserId)) {
+      throw Error('User ID must be 3-30 alphanumeric characters or underscores');
+    }
+
+    const targetRole = String(role).toLowerCase();
+    if (!['store_admin', 'operator'].includes(targetRole)) {
+      throw Error("Role must be 'store_admin' or 'operator'");
+    }
+
+    // Hierarchy enforcement: Store Admin can ONLY create Operators
+    if (isAdmin && !isOwnerOrPlatform && targetRole !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Store Admins can only add Operators' });
+    }
+
+    const existingUser = await db.get('SELECT * FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanUserId]);
+    if (existingUser) {
+      // User already exists in database: check existing store membership
+      const existingMembership = await db.get(
+        'SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?',
+        [q.storeId, existingUser.user_id]
+      );
+
+      if (existingMembership && existingMembership.status === 'active') {
+        return r.status(400).json({ ok: false, error: `User '${existingUser.user_id}' is already an active member of this store` });
+      }
+
+      if (existingMembership) {
+        await db.run(
+          "UPDATE store_memberships SET status = 'active', role = ? WHERE id = ?",
+          [targetRole, existingMembership.id]
+        );
+      } else {
+        await db.run(
+          "INSERT INTO store_memberships (store_id, user_id, role, status) VALUES (?, ?, ?, 'active')",
+          [q.storeId, existingUser.user_id, targetRole]
+        );
+      }
+    } else {
+      // New user registration
+      if (!password || String(password).length < 8) {
+        throw Error('Password must have at least 8 characters');
+      }
+      if (!displayName || !String(displayName).trim()) {
+        throw Error('Full name / Display name is required');
+      }
+
+      const salt = crypto.randomBytes(16).toString('hex');
+      const passwordHash = hash(password, salt);
+      const dbRole = targetRole === 'store_admin' ? 'boss' : 'operator';
+      const effectiveRole = targetRole === 'store_admin' ? 'admin' : 'operator';
+
+      await db.run(`
+        INSERT INTO users (
+          user_id, password_hash, salt, display_name, role, active,
+          approval_status, requested_role, effective_role, email, phone,
+          employee_id, reviewed_at, reviewed_by
+        ) VALUES (?, ?, ?, ?, ?, 1, 'approved', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+      `, [
+        cleanUserId,
+        passwordHash,
+        salt,
+        String(displayName).trim(),
+        dbRole,
+        effectiveRole,
+        effectiveRole,
+        email ? String(email).trim().toLowerCase() : null,
+        phone ? String(phone).trim() : null,
+        employeeId ? String(employeeId).trim() : null,
+        q.user.userId
+      ]);
+
+      await db.run(
+        "INSERT INTO store_memberships (store_id, user_id, role, status) VALUES (?, ?, ?, 'active')",
+        [q.storeId, cleanUserId, targetRole]
+      );
+    }
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'MEMBER_ADDED', 'membership', ?, ?)
+    `, [q.storeId, q.user.userId, cleanUserId, `Added member '${cleanUserId}' with role '${targetRole}' to store`]).catch(() => {});
+
+    r.json({ ok: true, message: `Staff member '${cleanUserId}' added as ${targetRole}.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Staff: Deactivate a member (Self-lockout protection & hierarchy enforced)
+app.post('/api/stores/:storeId/members/:memberId/deactivate', tenantContext, async (q, r) => {
+  try {
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isAdmin = q.storeRole === 'store_admin';
+
+    if (!isOwnerOrPlatform && !isAdmin) {
+      return r.status(403).json({ ok: false, error: 'Operators cannot view or manage store staff' });
+    }
+
+    const memberParam = q.params.memberId;
+    const member = await db.get(
+      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR user_id = ?)',
+      [q.storeId, Number(memberParam) || -1, memberParam]
+    );
+
+    if (!member) {
+      return r.status(404).json({ ok: false, error: 'Member not found in this store' });
+    }
+
+    // Hierarchy enforcement: Store Admin can ONLY deactivate Operators
+    if (isAdmin && !isOwnerOrPlatform && member.role !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Store Admins can only manage Operators' });
+    }
+
+    // Self-lockout protection for sole Store Owner
+    if (member.user_id === q.user.userId && member.role === 'store_owner') {
+      const otherOwners = await db.get(
+        "SELECT COUNT(*) as n FROM store_memberships WHERE store_id = ? AND role = 'store_owner' AND status = 'active' AND user_id != ?",
+        [q.storeId, q.user.userId]
+      );
+      if (Number(otherOwners?.n || 0) === 0) {
+        return r.status(400).json({ ok: false, error: 'Cannot deactivate the only active Store Owner for this store' });
+      }
+    }
+
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE id = ?", [member.id]);
+
+    // Invalidate sessions for that user
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [member.user_id]);
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'MEMBER_DEACTIVATED', 'membership', ?, ?)
+    `, [q.storeId, q.user.userId, member.user_id, `Deactivated member '${member.user_id}' in store`]).catch(() => {});
+
+    r.json({ ok: true, message: `Member '${member.user_id}' has been deactivated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Staff: Activate a member
+app.post('/api/stores/:storeId/members/:memberId/activate', tenantContext, async (q, r) => {
+  try {
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isAdmin = q.storeRole === 'store_admin';
+
+    if (!isOwnerOrPlatform && !isAdmin) {
+      return r.status(403).json({ ok: false, error: 'Operators cannot view or manage store staff' });
+    }
+
+    const memberParam = q.params.memberId;
+    const member = await db.get(
+      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR user_id = ?)',
+      [q.storeId, Number(memberParam) || -1, memberParam]
+    );
+
+    if (!member) {
+      return r.status(404).json({ ok: false, error: 'Member not found in this store' });
+    }
+
+    if (isAdmin && !isOwnerOrPlatform && member.role !== 'operator') {
+      return r.status(403).json({ ok: false, error: 'Store Admins can only manage Operators' });
+    }
+
+    await db.run("UPDATE store_memberships SET status = 'active' WHERE id = ?", [member.id]);
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'MEMBER_ACTIVATED', 'membership', ?, ?)
+    `, [q.storeId, q.user.userId, member.user_id, `Activated member '${member.user_id}' in store`]).catch(() => {});
+
+    r.json({ ok: true, message: `Member '${member.user_id}' has been activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Hardware Devices: List devices for store
+app.get('/api/stores/:storeId/devices', tenantContext, storeAdminOnly, async (q, r) => {
+  try {
+    const devices = await db.all(
+      "SELECT id, store_id, device_name, status, created_at, SUBSTR(device_key, 1, 12) || '...' as masked_key FROM store_devices WHERE store_id = ? ORDER BY id DESC",
+      [q.storeId]
+    );
+    r.json({ ok: true, devices });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Hardware Devices: Register/generate new hardware device for store (Store Owner only)
+app.post('/api/stores/:storeId/devices', tenantContext, storeOwnerOnly, async (q, r) => {
+  try {
+    const { deviceName = 'ESP32 Controller' } = q.body || {};
+    const newKey = 'asrs_hw_' + crypto.randomBytes(16).toString('hex');
+    await db.run(
+      'INSERT INTO store_devices (store_id, device_key, device_name, status) VALUES (?, ?, ?, ?)',
+      [q.storeId, newKey, String(deviceName).trim(), 'active']
+    );
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'DEVICE_REGISTERED', 'device', ?, ?)
+    `, [q.storeId, q.user.userId, String(deviceName).trim(), `Registered hardware device '${deviceName}'`]).catch(() => {});
+
+    r.json({
+      ok: true,
+      storeId: q.storeId,
+      deviceName: String(deviceName).trim(),
+      deviceKey: newKey
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Hardware Devices: Rotate key for a store hardware device (Store Owner only - SEC-04)
+app.post('/api/stores/:storeId/devices/:deviceId/rotate', tenantContext, storeOwnerOnly, async (q, r) => {
+  try {
+    const deviceId = Number(q.params.deviceId);
+    const dev = await db.get('SELECT * FROM store_devices WHERE store_id = ? AND id = ?', [q.storeId, deviceId]);
+    if (!dev) return r.status(404).json({ ok: false, error: 'Hardware device not found in this store' });
+
+    const newKey = 'asrs_hw_' + crypto.randomBytes(16).toString('hex');
+    await db.run('UPDATE store_devices SET device_key = ? WHERE id = ?', [newKey, deviceId]);
+
+    if (q.storeId === 'store_default_001') {
+      await db.run("UPDATE system_settings SET value = ? WHERE key = 'hardware_api_key'", [newKey]);
+    }
+
+    await db.run(`
+      INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
+      VALUES (?, ?, 'DEVICE_KEY_ROTATED', 'device', ?, ?)
+    `, [q.storeId, q.user.userId, String(deviceId), `Rotated key for device '${dev.device_name}'`]).catch(() => {});
+
+    r.json({
+      ok: true,
+      deviceId,
+      deviceName: dev.device_name,
+      deviceKey: newKey,
+      message: `Device key for '${dev.device_name}' has been successfully rotated.`
+    });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
