@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - 'feature/**'
+      - 'fix/**'
+      - 'chore/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-sqlite:
+    name: SQLite Test Suite (Isolated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm --prefix backend ci
+
+      - name: Run SQLite test suite
+        env:
+          NODE_ENV: test
+        run: npm --prefix backend test
+
+      - name: Clean up temporary test databases
+        if: always()
+        run: |
+          rm -f backend/tests/asrs.test.db*
+
+  test-postgres:
+    name: PostgreSQL 17 Test Suite (Disposable Service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: asrs_ci_user
+          POSTGRES_PASSWORD: asrs_ci_password_never_use_in_prod
+          POSTGRES_DB: asrs_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm --prefix backend ci
+
+      - name: Verify PostgreSQL client availability
+        run: |
+          if ! command -v psql &> /dev/null; then
+            sudo apt-get update -y && sudo apt-get install -y postgresql-client
+          fi
+          psql --version
+
+      - name: Run baseline and multi-tenant migrations against disposable PostgreSQL
+        env:
+          PGPASSWORD: asrs_ci_password_never_use_in_prod
+        run: |
+          psql -h 127.0.0.1 -p 5432 -U asrs_ci_user -d asrs_ci_test -v ON_ERROR_STOP=1 -f backend/migrations/001_baseline_pg.sql
+          psql -h 127.0.0.1 -p 5432 -U asrs_ci_user -d asrs_ci_test -v ON_ERROR_STOP=1 -f backend/migrations/002_multi_tenant_core.sql
+
+      - name: Run PostgreSQL test suite
+        env:
+          DATABASE_URL: "postgres://asrs_ci_user:asrs_ci_password_never_use_in_prod@127.0.0.1:5432/asrs_ci_test?sslmode=disable"
+          NODE_ENV: test
+        run: npm --prefix backend test

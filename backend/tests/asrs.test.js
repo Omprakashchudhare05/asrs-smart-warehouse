@@ -5,7 +5,12 @@ const fs = require('fs');
 const liveDbPath = path.join(__dirname, '../asrs.db');
 const testDbPath = path.join(__dirname, 'asrs.test.db');
 if (!process.env.DATABASE_URL) {
-  fs.copyFileSync(liveDbPath, testDbPath);
+  if (fs.existsSync(liveDbPath)) {
+    fs.copyFileSync(liveDbPath, testDbPath);
+  } else {
+    const { initTestSqlite } = require('./init-test-sqlite');
+    initTestSqlite(testDbPath);
+  }
   process.env.SQLITE_DB_PATH = testDbPath;
 }
 
