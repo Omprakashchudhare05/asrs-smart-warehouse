@@ -6,11 +6,44 @@ let sqliteDb = null;
 let pgPool = null;
 const isPg = Boolean(process.env.DATABASE_URL);
 
+function getPgSslConfig(databaseUrl) {
+  if (!databaseUrl) return false;
+  try {
+    const parsed = new URL(databaseUrl);
+    const hostname = (parsed.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+    const sslParam = (parsed.searchParams.get('ssl') || '').toLowerCase();
+    const sslmode = (parsed.searchParams.get('sslmode') || '').toLowerCase();
+
+    // Explicit SSL disable via query parameter
+    if (sslmode === 'disable' || sslParam === 'false' || sslParam === '0') {
+      return false;
+    }
+
+    // Explicit SSL enable via query parameter
+    if (sslmode === 'require' || sslmode === 'verify-full' || sslmode === 'verify-ca' || sslmode === 'no-verify' || sslParam === 'true' || sslParam === '1') {
+      return { rejectUnauthorized: false };
+    }
+
+    // Default: loopback connections default to SSL disabled, remote connections require SSL
+    if (isLocal) {
+      return false;
+    }
+    return { rejectUnauthorized: false };
+  } catch {
+    const lower = String(databaseUrl).toLowerCase();
+    if (lower.includes('localhost') || lower.includes('127.0.0.1') || lower.includes('::1')) {
+      return false;
+    }
+    return { rejectUnauthorized: false };
+  }
+}
+
 if (isPg) {
   const { Pool } = require('pg');
   pgPool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+    ssl: getPgSslConfig(process.env.DATABASE_URL)
   });
 } else {
   const Database = require('better-sqlite3');
@@ -64,6 +97,65 @@ async function run(sql, params = []) {
   } else {
     const info = sqliteDb.prepare(sql).run(...params);
     return { changes: info.changes, lastInsertRowid: info.lastInsertRowid };
+  }
+}
+
+async function withTransaction(fn) {
+  if (isPg) {
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const tx = {
+        query: async (sql, params = []) => client.query(toPgSql(sql), params),
+        get: async (sql, params = []) => {
+          const res = await client.query(toPgSql(sql), params);
+          return res.rows[0] || null;
+        },
+        all: async (sql, params = []) => {
+          const res = await client.query(toPgSql(sql), params);
+          return res.rows;
+        },
+        run: async (sql, params = []) => {
+          const res = await client.query(toPgSql(sql), params);
+          return { changes: res.rowCount };
+        }
+      };
+      const result = await fn(tx);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    sqliteDb.exec('BEGIN IMMEDIATE');
+    try {
+      const tx = {
+        query: async (sql, params = []) => {
+          const stmt = sqliteDb.prepare(sql);
+          if (/^\s*(SELECT|PRAGMA)/i.test(sql)) {
+            return { rows: stmt.all(...params) };
+          } else {
+            const info = stmt.run(...params);
+            return { rowCount: info.changes, lastInsertRowid: info.lastInsertRowid };
+          }
+        },
+        get: async (sql, params = []) => sqliteDb.prepare(sql).get(...params) || null,
+        all: async (sql, params = []) => sqliteDb.prepare(sql).all(...params),
+        run: async (sql, params = []) => {
+          const info = sqliteDb.prepare(sql).run(...params);
+          return { changes: info.changes, lastInsertRowid: info.lastInsertRowid };
+        }
+      };
+      const result = await fn(tx);
+      sqliteDb.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try { sqliteDb.exec('ROLLBACK'); } catch {}
+      throw err;
+    }
   }
 }
 
@@ -438,8 +530,30 @@ async function initDb() {
     ]);
   }
 
+  // Ensure primary platform owner exists if bootstrap password or test environment is present
+  const existingBoss = await get("SELECT * FROM users WHERE role = 'boss' AND active = 1");
+  if (!existingBoss) {
+    const bootstrapPass = process.env.ADMIN_INITIAL_PASSWORD || (process.env.NODE_ENV === 'test' ? 'TestBossSecurePass2026!' : null);
+    if (bootstrapPass) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      const passHash = crypto.scryptSync(bootstrapPass, salt, 64).toString('hex');
+      const existingUser = await get("SELECT * FROM users WHERE user_id = 'testboss'");
+      if (!existingUser) {
+        await run(`
+          INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, effective_role, platform_role)
+          VALUES ('testboss', ?, ?, 'Test Boss', 'boss', 1, 'approved', 'owner', 'platform_owner')
+        `, [passHash, salt]);
+      } else {
+        await run(`
+          UPDATE users SET password_hash = ?, salt = ?, active = 1, approval_status = 'approved', effective_role = 'owner', platform_role = 'platform_owner'
+          WHERE user_id = 'testboss'
+        `, [passHash, salt]);
+      }
+    }
+  }
+
   // Ensure testboss has platform_owner and store_owner in default store
-  await run("UPDATE users SET platform_role = 'platform_owner' WHERE user_id = 'testboss' AND (platform_role IS NULL OR platform_role = '')");
+  await run("UPDATE users SET platform_role = 'platform_owner', effective_role = 'owner' WHERE user_id = 'testboss' AND (platform_role IS NULL OR platform_role = '' OR effective_role IS NULL)");
   const testbossMember = await get("SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'testboss'");
   if (!testbossMember) {
     await run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', 'testboss', 'store_owner', 'active')");
@@ -507,7 +621,9 @@ module.exports = {
   all,
   get,
   run,
+  withTransaction,
   initDb,
+  getPgSslConfig,
   pool: pgPool,
   sqlite: sqliteDb
 };

@@ -242,6 +242,14 @@ app.post('/auth/register/admin', async (q, r) => {
   }
 });
 
+// Mutual exclusion lock for first-owner setup operations to eliminate concurrency race conditions
+let setupLockPromise = Promise.resolve();
+function withSetupLock(fn) {
+  const next = setupLockPromise.then(fn, fn);
+  setupLockPromise = next.catch(() => {});
+  return next;
+}
+
 // A. First-Time Admin Registration Step 1: Request OTPs
 app.post('/auth/setup-admin/request', async (q, r) => {
   try {
@@ -367,74 +375,102 @@ app.post('/auth/setup-admin/verify', async (q, r) => {
       throw Error('User ID, Email OTP and Mobile OTP are all required');
     }
 
-    const pendingUser = await db.get("SELECT * FROM users WHERE user_id = ? AND active = 0 AND role = 'boss'", [String(userId).trim()]);
-    if (!pendingUser) {
-      throw Error('No pending registration found for this User ID. Please restart setup.');
-    }
+    let token = '';
+    let verifiedUser = null;
 
-    const emailRec = await db.get(
-      "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'email' AND purpose = 'admin_registration' AND verified = 0",
-      [pendingUser.user_id]
-    );
-    const phoneRec = await db.get(
-      "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'phone' AND purpose = 'admin_registration' AND verified = 0",
-      [pendingUser.user_id]
-    );
+    await withSetupLock(async () => {
+      await db.withTransaction(async (tx) => {
+        if (db.isPg) {
+          await tx.query("SELECT id FROM warehouse_config WHERE id = 1 FOR UPDATE");
+        }
 
-    if (!emailRec || !phoneRec) {
-      throw Error('Verification record not found. Please request a new code.');
-    }
+        // Re-check owner existence at the exact point of activation to eliminate race conditions
+        const activeBoss = await tx.get("SELECT id FROM users WHERE role='boss' AND active=1");
+        if (activeBoss) {
+          const conflictErr = new Error('An active administrator account already exists. Setup is closed.');
+          conflictErr.status = 409;
+          throw conflictErr;
+        }
 
-    // Check expiry (5 minutes)
-    const now = new Date();
-    if (new Date(emailRec.expires_at) < now || new Date(phoneRec.expires_at) < now) {
-      throw Error('One or more OTPs have expired. Please request a new verification code.');
-    }
+        const pendingUser = await tx.get("SELECT * FROM users WHERE user_id = ? AND active = 0 AND role = 'boss'", [String(userId).trim()]);
+        if (!pendingUser) {
+          throw Error('No pending registration found for this User ID. Please restart setup.');
+        }
 
-    // Check attempt limits
-    if (emailRec.attempts >= emailRec.max_attempts || phoneRec.attempts >= phoneRec.max_attempts) {
-      throw Error('Too many failed attempts. This registration verification has been locked. Please restart setup.');
-    }
+        const emailRec = await tx.get(
+          "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'email' AND purpose = 'admin_registration' AND verified = 0",
+          [pendingUser.user_id]
+        );
+        const phoneRec = await tx.get(
+          "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'phone' AND purpose = 'admin_registration' AND verified = 0",
+          [pendingUser.user_id]
+        );
 
-    // Verify Email OTP
-    const emailValid = otpService.verifyOtpHash(emailOtp, emailRec.otp_hash);
-    if (!emailValid) {
-      await db.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [emailRec.id]);
-      const left = emailRec.max_attempts - emailRec.attempts - 1;
-      throw Error(`Invalid Email OTP. ${Math.max(0, left)} attempts remaining.`);
-    }
+        if (!emailRec || !phoneRec) {
+          throw Error('Verification record not found. Please request a new code.');
+        }
 
-    // Verify Mobile OTP
-    const phoneValid = otpService.verifyOtpHash(phoneOtp, phoneRec.otp_hash);
-    if (!phoneValid) {
-      await db.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [phoneRec.id]);
-      const left = phoneRec.max_attempts - phoneRec.attempts - 1;
-      throw Error(`Invalid Mobile OTP. ${Math.max(0, left)} attempts remaining.`);
-    }
+        // Check expiry (5 minutes)
+        const now = new Date();
+        if (new Date(emailRec.expires_at) < now || new Date(phoneRec.expires_at) < now) {
+          throw Error('One or more OTPs have expired. Please request a new verification code.');
+        }
 
-    // Mark OTPs verified
-    await db.run("UPDATE otp_verifications SET verified = 1 WHERE user_id = ? AND purpose = 'admin_registration'", [pendingUser.user_id]);
+        // Check attempt limits
+        if (emailRec.attempts >= emailRec.max_attempts || phoneRec.attempts >= phoneRec.max_attempts) {
+          throw Error('Too many failed attempts. This registration verification has been locked. Please restart setup.');
+        }
 
-    // Activate admin user
-    await db.run("UPDATE users SET active = 1, email_verified = 1, phone_verified = 1 WHERE user_id = ?", [pendingUser.user_id]);
+        // Verify Email OTP
+        const emailValid = otpService.verifyOtpHash(emailOtp, emailRec.otp_hash);
+        if (!emailValid) {
+          await tx.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [emailRec.id]);
+          const left = emailRec.max_attempts - emailRec.attempts - 1;
+          throw Error(`Invalid Email OTP. ${Math.max(0, left)} attempts remaining.`);
+        }
 
-    // Create session token
-    const token = crypto.randomBytes(32).toString('hex');
-    await db.run("INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)", [
-      token,
-      pendingUser.user_id,
-      pendingUser.display_name,
-      'boss'
-    ]);
+        // Verify Mobile OTP
+        const phoneValid = otpService.verifyOtpHash(phoneOtp, phoneRec.otp_hash);
+        if (!phoneValid) {
+          await tx.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [phoneRec.id]);
+          const left = phoneRec.max_attempts - phoneRec.attempts - 1;
+          throw Error(`Invalid Mobile OTP. ${Math.max(0, left)} attempts remaining.`);
+        }
+
+        // Mark OTPs verified
+        await tx.run("UPDATE otp_verifications SET verified = 1 WHERE user_id = ? AND purpose = 'admin_registration'", [pendingUser.user_id]);
+
+        // Activate admin user and assign platform owner
+        await tx.run("UPDATE users SET active = 1, email_verified = 1, phone_verified = 1, approval_status = 'approved', effective_role = 'owner', platform_role = 'platform_owner' WHERE user_id = ?", [pendingUser.user_id]);
+
+        // Ensure member of default store
+        const member = await tx.get("SELECT id FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = ?", [pendingUser.user_id]);
+        if (!member) {
+          await tx.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', ?, 'store_owner', 'active')", [pendingUser.user_id]);
+        }
+        await tx.run("UPDATE stores SET owner_user_id = ? WHERE id = 'store_default_001'", [pendingUser.user_id]);
+
+        // Create session token
+        token = crypto.randomBytes(32).toString('hex');
+        await tx.run("INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)", [
+          token,
+          pendingUser.user_id,
+          pendingUser.display_name,
+          'boss'
+        ]);
+
+        verifiedUser = { ...pendingUser, active: 1, email_verified: 1, phone_verified: 1 };
+      });
+    });
 
     r.json({
       ok: true,
       token,
-      user: safeUser({ ...pendingUser, active: 1, email_verified: 1, phone_verified: 1 }),
+      user: safeUser(verifiedUser),
       message: 'Admin account verified and activated successfully!'
     });
   } catch (e) {
-    r.status(400).json({ ok: false, error: e.message });
+    r.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
 
@@ -819,10 +855,6 @@ app.post('/auth/profile/verify-otp', authenticateUser, bossOnly, async (q, r) =>
 // Initial Setup (First Boss account + Warehouse - legacy backward compatibility)
 app.post('/auth/setup', async (q, r) => {
   try {
-    const bossCount = await db.get("SELECT COUNT(*) as n FROM users WHERE role='boss' AND active=1");
-    if (Number(bossCount?.n || 0) > 0) {
-      return r.status(409).json({ ok: false, error: 'Boss account already exists. Please log in.' });
-    }
     const { userId, password, displayName, warehouseName, warehouseCode, location, email, phone } = q.body || {};
     if (!userId || !password || password.length < 8) {
       throw Error('Enter a User ID and password with at least 8 characters');
@@ -830,24 +862,79 @@ app.post('/auth/setup', async (q, r) => {
     if (!String(warehouseName || '').trim() || !String(warehouseCode || '').trim() || !String(location || '').trim()) {
       throw Error('Enter warehouse name, warehouse code and location first');
     }
-    const salt = crypto.randomBytes(16).toString('hex');
-    await db.run('INSERT INTO warehouse_config(id, warehouse_name, warehouse_code, location) VALUES(1, ?, ?, ?)', [
-      String(warehouseName).trim(),
-      String(warehouseCode).trim(),
-      String(location).trim()
-    ]);
-    await db.run('INSERT INTO users(user_id, password_hash, salt, display_name, role, active, email, phone) VALUES(?, ?, ?, ?, ?, 1, ?, ?)', [
-      String(userId).trim(),
-      hash(password, salt),
-      salt,
-      String(displayName || 'Boss/Admin').trim(),
-      'boss',
-      email || null,
-      phone || null
-    ]);
+
+    await withSetupLock(async () => {
+      await db.withTransaction(async (tx) => {
+        if (db.isPg) {
+          await tx.query("SELECT id FROM warehouse_config WHERE id = 1 FOR UPDATE");
+        }
+
+        // Re-check owner existence at the exact point of creation inside the locked transaction
+        const bossCount = await tx.get("SELECT COUNT(*) as n FROM users WHERE role='boss' AND active=1");
+        if (Number(bossCount?.n || 0) > 0) {
+          const conflictErr = new Error('Boss account already exists. Please log in.');
+          conflictErr.status = 409;
+          throw conflictErr;
+        }
+
+        const salt = crypto.randomBytes(16).toString('hex');
+        const existingW = await tx.get('SELECT id FROM warehouse_config WHERE id=1');
+        if (!existingW) {
+          await tx.run('INSERT INTO warehouse_config(id, warehouse_name, warehouse_code, location) VALUES(1, ?, ?, ?)', [
+            String(warehouseName).trim(),
+            String(warehouseCode).trim(),
+            String(location).trim()
+          ]);
+        } else {
+          await tx.run('UPDATE warehouse_config SET warehouse_name=?, warehouse_code=?, location=? WHERE id=1', [
+            String(warehouseName).trim(),
+            String(warehouseCode).trim(),
+            String(location).trim()
+          ]);
+        }
+
+        const cleanId = String(userId).trim();
+        const existingU = await tx.get('SELECT id FROM users WHERE user_id = ?', [cleanId]);
+        if (!existingU) {
+          await tx.run('INSERT INTO users(user_id, password_hash, salt, display_name, role, active, email, phone, approval_status, effective_role, platform_role) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)', [
+            cleanId,
+            hash(password, salt),
+            salt,
+            String(displayName || 'Boss/Admin').trim(),
+            'boss',
+            email || null,
+            phone || null,
+            'approved',
+            'owner',
+            'platform_owner'
+          ]);
+        } else {
+          await tx.run('UPDATE users SET password_hash=?, salt=?, display_name=?, role=?, active=1, email=?, phone=?, approval_status=?, effective_role=?, platform_role=? WHERE user_id=?', [
+            hash(password, salt),
+            salt,
+            String(displayName || 'Boss/Admin').trim(),
+            'boss',
+            email || null,
+            phone || null,
+            'approved',
+            'owner',
+            'platform_owner',
+            cleanId
+          ]);
+        }
+
+        // Grant membership in default store
+        const mem = await tx.get("SELECT id FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = ?", [cleanId]);
+        if (!mem) {
+          await tx.run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', ?, 'store_owner', 'active')", [cleanId]);
+        }
+        await tx.run("UPDATE stores SET owner_user_id = ? WHERE id = 'store_default_001'", [cleanId]);
+      });
+    });
+
     r.json({ ok: true });
   } catch (e) {
-    r.status(400).json({ ok: false, error: e.message });
+    r.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
 

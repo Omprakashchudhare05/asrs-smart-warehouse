@@ -2010,3 +2010,203 @@ test('46. Startup Backfill Idempotency & Zero Auto-Enrollment: initDb does not g
   );
   assert.ok(Number(defaultStoreSlots.n) >= 16, 'Default store must maintain its slots');
 });
+
+test('47. Secure First-Owner Bootstrap & Password Hashing: initDb provisions owner without hardcoded credentials', async () => {
+  const boss = await db.get("SELECT user_id, password_hash, salt, role, effective_role, platform_role FROM users WHERE user_id = 'testboss'");
+  assert.ok(boss, 'testboss must exist in database');
+  assert.equal(boss.role, 'boss');
+  assert.equal(boss.platform_role, 'platform_owner');
+  assert.equal(boss.effective_role, 'owner');
+  assert.ok(boss.salt && boss.salt.length === 32, 'Salt must be a 16-byte hex string');
+  assert.ok(boss.password_hash && boss.password_hash.length === 128, 'Password hash must be 64-byte scrypt hex');
+
+  // Verify membership in default store
+  const mem = await db.get("SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'testboss'");
+  assert.ok(mem, 'testboss must be enrolled in default store');
+  assert.equal(mem.role, 'store_owner');
+  assert.equal(mem.status, 'active');
+});
+
+test('48. Dynamic Hardware Device Provisioning: initDb generates and binds hardware API key per store', async () => {
+  const hwKeyRow = await db.get("SELECT value FROM system_settings WHERE key = 'hardware_api_key'");
+  assert.ok(hwKeyRow && hwKeyRow.value, 'hardware_api_key must exist in system_settings');
+  assert.ok(hwKeyRow.value.startsWith('asrs_hw_'), 'Device key must have standard asrs_hw_ prefix');
+
+  // Verify registered in store_devices
+  const dev = await db.get("SELECT * FROM store_devices WHERE device_key = ?", [hwKeyRow.value]);
+  assert.ok(dev, 'Hardware device must be registered in store_devices');
+  assert.equal(dev.store_id, 'store_default_001');
+  assert.equal(dev.status, 'active');
+});
+
+test('49. Startup Provisioning Idempotency: Repeated initDb calls preserve credentials and hardware keys', async () => {
+  const bossBefore = await db.get("SELECT password_hash, salt FROM users WHERE user_id = 'testboss'");
+  assert.ok(bossBefore, 'testboss must exist');
+
+  const hwKeyBefore = await db.get("SELECT value FROM system_settings WHERE key = 'hardware_api_key'");
+  assert.ok(hwKeyBefore && hwKeyBefore.value, 'hardware_api_key must exist');
+
+  const devBefore = await db.get("SELECT device_key FROM store_devices WHERE store_id = 'store_default_001'");
+  assert.ok(devBefore, 'Default store device must exist');
+
+  // Trigger repeated initDb calls
+  await db.initDb();
+  await db.initDb();
+
+  const bossAfter = await db.get("SELECT password_hash, salt FROM users WHERE user_id = 'testboss'");
+  assert.equal(bossAfter.password_hash, bossBefore.password_hash, 'Password hash must remain identical');
+  assert.equal(bossAfter.salt, bossBefore.salt, 'Salt must remain identical');
+
+  const hwKeyAfter = await db.get("SELECT value FROM system_settings WHERE key = 'hardware_api_key'");
+  assert.equal(hwKeyAfter.value, hwKeyBefore.value, 'Hardware API key must not be regenerated');
+
+  const devAfter = await db.get("SELECT device_key FROM store_devices WHERE store_id = 'store_default_001'");
+  assert.equal(devAfter.device_key, devBefore.device_key, 'Store device key must remain unchanged');
+});
+
+test('50. First-Owner Setup Concurrency: Concurrent /auth/setup requests guarantee single owner and 409 Conflict', async () => {
+  // Temporarily deactivate boss accounts to simulate clean initial state
+  await db.run("UPDATE users SET active = 0 WHERE role = 'boss'");
+
+  try {
+    const userA = 'concurrent_owner_a';
+    const userB = 'concurrent_owner_b';
+
+    // Dispatch two concurrent setup requests simultaneously
+    const [resA, resB] = await Promise.all([
+      api('/auth/setup', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: userA,
+          password: 'PasswordA123!',
+          displayName: 'Owner Candidate A',
+          warehouseName: 'Concurrent WH A',
+          warehouseCode: 'CWH-A',
+          location: 'Hub A'
+        })
+      }),
+      api('/auth/setup', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: userB,
+          password: 'PasswordB123!',
+          displayName: 'Owner Candidate B',
+          warehouseName: 'Concurrent WH B',
+          warehouseCode: 'CWH-B',
+          location: 'Hub B'
+        })
+      })
+    ]);
+
+    // Exactly one must succeed (200) and the loser must be rejected with 409 Conflict
+    const statuses = [resA.status, resB.status].sort();
+    assert.deepEqual(statuses, [200, 409], 'One request must succeed (200) and one must fail with conflict (409)');
+
+    const losingRes = resA.status === 409 ? resA : resB;
+    assert.match(losingRes.data.error, /already exists/i, 'Losing request receives descriptive conflict error');
+
+    // Database must have strictly ONE active boss
+    const activeBosses = await db.all("SELECT user_id FROM users WHERE role = 'boss' AND active = 1");
+    assert.equal(activeBosses.length, 1, 'Strictly one active boss account must exist in the database');
+  } finally {
+    // Clean up test candidates and restore original testboss
+    await db.run("DELETE FROM users WHERE user_id IN ('concurrent_owner_a', 'concurrent_owner_b')");
+    await db.run("DELETE FROM store_memberships WHERE user_id IN ('concurrent_owner_a', 'concurrent_owner_b')");
+    await db.run("UPDATE users SET active = 1 WHERE user_id = 'testboss'");
+    await db.run("UPDATE stores SET owner_user_id = 'testboss' WHERE id = 'store_default_001'");
+  }
+});
+
+test('51. First-Time Admin OTP Activation Concurrency: Concurrent /auth/setup-admin/verify requests guarantee single owner and 409 Conflict', async () => {
+  const otpService = require('../otp-service');
+  const capturedOtps = {};
+  otpService.setTestOtpListener(({ userId, type, otp, purpose }) => {
+    if (purpose === 'admin_registration') {
+      if (!capturedOtps[userId]) capturedOtps[userId] = {};
+      capturedOtps[userId][type] = otp;
+    }
+  });
+
+  // Temporarily deactivate boss accounts
+  await db.run("UPDATE users SET active = 0 WHERE role = 'boss'");
+
+  try {
+    // Request OTP for candidate 1
+    const req1 = await api('/auth/setup-admin/request', {
+      method: 'POST',
+      body: JSON.stringify({
+        userId: 'candidate_admin_1',
+        password: 'AdminPassword1!',
+        displayName: 'Candidate Admin 1',
+        email: 'cand1@warehouse.com',
+        phone: '+919811111111',
+        warehouseName: 'Hub One',
+        warehouseCode: 'HB-01',
+        location: 'City 1'
+      })
+    });
+    assert.equal(req1.status, 200);
+
+    // Request OTP for candidate 2 (both requested while active boss count is 0)
+    const req2 = await api('/auth/setup-admin/request', {
+      method: 'POST',
+      body: JSON.stringify({
+        userId: 'candidate_admin_2',
+        password: 'AdminPassword2!',
+        displayName: 'Candidate Admin 2',
+        email: 'cand2@warehouse.com',
+        phone: '+919822222222',
+        warehouseName: 'Hub Two',
+        warehouseCode: 'HB-02',
+        location: 'City 2'
+      })
+    });
+    assert.equal(req2.status, 200);
+
+    assert.ok(capturedOtps['candidate_admin_1']?.email);
+    assert.ok(capturedOtps['candidate_admin_1']?.phone);
+    assert.ok(capturedOtps['candidate_admin_2']?.email);
+    assert.ok(capturedOtps['candidate_admin_2']?.phone);
+
+    // Both candidates now hold valid OTPs and active = 0.
+    // Concurrently trigger verification and activation for both
+    const [ver1, ver2] = await Promise.all([
+      api('/auth/setup-admin/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: 'candidate_admin_1',
+          emailOtp: capturedOtps['candidate_admin_1'].email,
+          phoneOtp: capturedOtps['candidate_admin_1'].phone
+        })
+      }),
+      api('/auth/setup-admin/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: 'candidate_admin_2',
+          emailOtp: capturedOtps['candidate_admin_2'].email,
+          phoneOtp: capturedOtps['candidate_admin_2'].phone
+        })
+      })
+    ]);
+
+    // One must succeed (200), one must be rejected (409)
+    const verifyStatuses = [ver1.status, ver2.status].sort();
+    assert.deepEqual(verifyStatuses, [200, 409], 'One verification must succeed (200) and the loser must receive 409 Conflict');
+
+    const losingVerify = ver1.status === 409 ? ver1 : ver2;
+    assert.match(losingVerify.data.error, /already exists|Setup is closed/i);
+
+    // Strictly one active boss account exists
+    const activeBosses = await db.all("SELECT user_id FROM users WHERE role = 'boss' AND active = 1");
+    assert.equal(activeBosses.length, 1, 'Only one platform owner could be activated');
+  } finally {
+    otpService.setTestOtpListener(null);
+    // Clean up simulated users and OTPs
+    await db.run("DELETE FROM users WHERE user_id IN ('candidate_admin_1', 'candidate_admin_2')");
+    await db.run("DELETE FROM user_sessions WHERE user_id IN ('candidate_admin_1', 'candidate_admin_2')");
+    await db.run("DELETE FROM otp_verifications WHERE user_id IN ('candidate_admin_1', 'candidate_admin_2')");
+    await db.run("DELETE FROM store_memberships WHERE user_id IN ('candidate_admin_1', 'candidate_admin_2')");
+    await db.run("UPDATE users SET active = 1 WHERE user_id = 'testboss'");
+    await db.run("UPDATE stores SET owner_user_id = 'testboss' WHERE id = 'store_default_001'");
+  }
+});
