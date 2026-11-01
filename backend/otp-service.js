@@ -85,7 +85,17 @@ function maskPhone(phone) {
  * Inspect configured providers from environment
  */
 function getProviderStatus() {
-  const emailConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  const brevoConfigured = Boolean(process.env.BREVO_API_KEY && process.env.BREVO_API_KEY.trim());
+  const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  const emailConfigured = brevoConfigured || smtpConfigured;
+
+  let emailProvider = 'None (requires BREVO_API_KEY or SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM)';
+  if (brevoConfigured) {
+    emailProvider = 'Brevo HTTPS API';
+  } else if (smtpConfigured) {
+    emailProvider = 'SMTP (' + process.env.SMTP_HOST + ')';
+  }
+
   const smsConfigured = Boolean(
     (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER) ||
     (process.env.SMS_GATEWAY_URL && process.env.SMS_API_KEY)
@@ -93,7 +103,7 @@ function getProviderStatus() {
   return {
     email: {
       configured: emailConfigured,
-      provider: emailConfigured ? 'SMTP (' + process.env.SMTP_HOST + ')' : 'None (requires SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM)'
+      provider: emailProvider
     },
     sms: {
       configured: smsConfigured,
@@ -105,26 +115,67 @@ function getProviderStatus() {
 }
 
 /**
- * Dispatch Email OTP via configured SMTP provider
+ * Dispatch Email via Brevo HTTPS API (primary) or SMTP (fallback)
  */
-async function sendEmailOtp({ email, otp, purpose, userId }) {
-  // Test hook for isolated testing
-  if (process.env.NODE_ENV === 'test' && typeof testOtpListener === 'function') {
-    testOtpListener({ type: 'email', identifier: email, otp, purpose, userId });
-  }
-
+async function dispatchEmail({ to, subject, text, html, purpose, logLabel = 'Email' }) {
   const { email: emailStatus } = getProviderStatus();
   if (!emailStatus.configured) {
-    // Log clearly without revealing plaintext OTP
-    console.warn(`[OTP Service] Email OTP generated for ${maskEmail(email)} (${purpose}), but SMTP credentials are not configured in environment.`);
+    console.warn(`[OTP Service] ${logLabel} queued for ${maskEmail(to)}${purpose ? ' (' + purpose + ')' : ''}, but email credentials are not configured in environment.`);
     return {
       success: false,
       configured: false,
-      provider: 'smtp',
-      message: 'SMTP credentials not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
+      provider: 'none',
+      message: 'Email credentials not configured in environment variables (BREVO_API_KEY or SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
     };
   }
 
+  const brevoApiKey = (process.env.BREVO_API_KEY || '').trim();
+
+  // Primary: Brevo HTTPS REST API (Port 443 - zero SMTP port block)
+  if (brevoApiKey) {
+    try {
+      const senderEmail = (process.env.BREVO_SENDER_EMAIL || process.env.SMTP_USER || 'asrs.warehouse.system@gmail.com').trim();
+      const senderName = (process.env.BREVO_SENDER_NAME || 'ASRS Smart Warehouse').trim();
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json',
+          'api-key': brevoApiKey,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          sender: { name: senderName, email: senderEmail },
+          to: [{ email: to }],
+          subject,
+          textContent: text,
+          htmlContent: html
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const errMsg = data.message || `Brevo API returned HTTP ${res.status}`;
+        console.error(`[OTP Service] Failed to send ${logLabel.toLowerCase()} to ${maskEmail(to)} via Brevo:`, errMsg);
+        return { success: false, configured: true, provider: 'brevo_https', error: errMsg };
+      }
+
+      console.log(`[OTP Service] ${logLabel} successfully dispatched to ${maskEmail(to)} via Brevo HTTPS API.`);
+      return { success: true, configured: true, provider: 'brevo_https', messageId: data.messageId };
+    } catch (err) {
+      console.error(`[OTP Service] Brevo HTTPS request error for ${maskEmail(to)}:`, err.message);
+      return { success: false, configured: true, provider: 'brevo_https', error: err.message };
+    }
+  }
+
+  // Fallback: SMTP (e.g. for local environment or non-blocked environments)
   try {
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
@@ -133,41 +184,57 @@ async function sendEmailOtp({ email, otp, purpose, userId }) {
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS
-      }
+      },
+      connectionTimeout: 10000
     });
-
-    let subject = 'ASRS Smart Warehouse - Verification Code';
-    if (purpose === 'admin_registration' || purpose === 'operator_registration' || purpose === 'registration') {
-      subject = 'ASRS Smart Warehouse - Account Registration Verification Code';
-    } else if (purpose === 'forgot_password' || purpose === 'password_reset') {
-      subject = 'ASRS Smart Warehouse - Password Reset Verification Code';
-    } else if (purpose === 'profile_verification') {
-      subject = 'ASRS Smart Warehouse - Profile Email Verification Code';
-    }
 
     await transporter.sendMail({
       from: process.env.SMTP_FROM || `"ASRS System" <${process.env.SMTP_USER}>`,
-      to: email,
+      to,
       subject,
-      text: `Your ASRS verification code is: ${otp}\n\nThis code is valid for 5 minutes. Do not share this code with anyone.`,
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
-          <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
-          <p>Your one-time verification code is:</p>
-          <div style="font-size: 28px; font-weight: bold; letter-spacing: 4px; background: #f1f5f9; padding: 12px 20px; border-radius: 6px; display: inline-block;">
-            ${otp}
-          </div>
-          <p style="color: #64748b; font-size: 13px; margin-top: 16px;">This code expires in 5 minutes. If you did not request this, please ignore this email.</p>
-        </div>
-      `
+      text,
+      html
     });
 
-    console.log(`[OTP Service] Email OTP successfully dispatched to ${maskEmail(email)} via SMTP.`);
+    console.log(`[OTP Service] ${logLabel} successfully dispatched to ${maskEmail(to)} via SMTP.`);
     return { success: true, configured: true, provider: 'smtp' };
   } catch (err) {
-    console.error(`[OTP Service] Failed to send email to ${maskEmail(email)}:`, err.message);
+    console.error(`[OTP Service] Failed to send ${logLabel.toLowerCase()} to ${maskEmail(to)} via SMTP:`, err.message);
     return { success: false, configured: true, provider: 'smtp', error: err.message };
   }
+}
+
+/**
+ * Dispatch Email OTP via Brevo HTTPS API (primary) or SMTP (fallback)
+ */
+async function sendEmailOtp({ email, otp, purpose, userId }) {
+  // Test hook for isolated testing
+  if (process.env.NODE_ENV === 'test' && typeof testOtpListener === 'function') {
+    testOtpListener({ type: 'email', identifier: email, otp, purpose, userId });
+  }
+
+  let subject = 'ASRS Smart Warehouse - Verification Code';
+  if (purpose === 'admin_registration' || purpose === 'operator_registration' || purpose === 'registration') {
+    subject = 'ASRS Smart Warehouse - Account Registration Verification Code';
+  } else if (purpose === 'forgot_password' || purpose === 'password_reset') {
+    subject = 'ASRS Smart Warehouse - Password Reset Verification Code';
+  } else if (purpose === 'profile_verification') {
+    subject = 'ASRS Smart Warehouse - Profile Email Verification Code';
+  }
+
+  const text = `Your ASRS verification code is: ${otp}\n\nThis code is valid for 5 minutes. Do not share this code with anyone.`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
+      <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
+      <p>Your one-time verification code is:</p>
+      <div style="font-size: 28px; font-weight: bold; letter-spacing: 4px; background: #f1f5f9; padding: 12px 20px; border-radius: 6px; display: inline-block;">
+        ${otp}
+      </div>
+      <p style="color: #64748b; font-size: 13px; margin-top: 16px;">This code expires in 5 minutes. If you did not request this, please ignore this email.</p>
+    </div>
+  `;
+
+  return dispatchEmail({ to: email, subject, text, html, purpose, logLabel: 'Email OTP' });
 }
 
 /**
@@ -178,55 +245,24 @@ async function sendRegistrationConfirmationEmail({ email, userId, displayName, s
     testOtpListener({ type: 'email', identifier: email, purpose: 'registration_confirmation', userId });
   }
 
-  const { email: emailStatus } = getProviderStatus();
-  if (!emailStatus.configured) {
-    console.warn(`[OTP Service] Confirmation email queued for ${maskEmail(email)}, but SMTP credentials are not configured in environment.`);
-    return {
-      success: false,
-      configured: false,
-      provider: 'smtp',
-      message: 'SMTP credentials not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
-    };
-  }
+  const subject = 'ASRS Smart Warehouse - Account Registration Confirmed';
+  const text = `Hello ${displayName || userId},\n\nYour ASRS registration request has been submitted successfully.\n\nAccount Details:\n- User ID: ${userId}\n- Email: ${email}\n${storeName ? `- Store: ${storeName}\n` : ''}- Status: Pending Administrator Approval\n\nNote: You will be able to log in once your store administrator approves your account.\n\nThank you,\nASRS Team`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
+      <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
+      <p>Hello <b>${displayName || userId}</b>,</p>
+      <p>Your ASRS account registration request has been submitted successfully.</p>
+      <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin: 16px 0;">
+        <p style="margin: 4px 0;"><b>User ID:</b> <code>${userId}</code></p>
+        <p style="margin: 4px 0;"><b>Registered Email:</b> ${email}</p>
+        ${storeName ? `<p style="margin: 4px 0;"><b>Assigned Store:</b> ${storeName}</p>` : ''}
+        <p style="margin: 4px 0;"><b>Status:</b> <span style="color: #d97706; font-weight: bold;">Pending Administrator Approval</span></p>
+      </div>
+      <p style="color: #64748b; font-size: 13px;">Your store administrator will review your application. You will be able to sign in once approved.</p>
+    </div>
+  `;
 
-  try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: process.env.SMTP_SECURE === 'true',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || `"ASRS System" <${process.env.SMTP_USER}>`,
-      to: email,
-      subject: 'ASRS Smart Warehouse - Account Registration Confirmed',
-      text: `Hello ${displayName || userId},\n\nYour ASRS registration request has been submitted successfully.\n\nAccount Details:\n- User ID: ${userId}\n- Email: ${email}\n${storeName ? `- Store: ${storeName}\n` : ''}- Status: Pending Administrator Approval\n\nNote: You will be able to log in once your store administrator approves your account.\n\nThank you,\nASRS Team`,
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
-          <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
-          <p>Hello <b>${displayName || userId}</b>,</p>
-          <p>Your ASRS account registration request has been submitted successfully.</p>
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin: 16px 0;">
-            <p style="margin: 4px 0;"><b>User ID:</b> <code>${userId}</code></p>
-            <p style="margin: 4px 0;"><b>Registered Email:</b> ${email}</p>
-            ${storeName ? `<p style="margin: 4px 0;"><b>Assigned Store:</b> ${storeName}</p>` : ''}
-            <p style="margin: 4px 0;"><b>Status:</b> <span style="color: #d97706; font-weight: bold;">Pending Administrator Approval</span></p>
-          </div>
-          <p style="color: #64748b; font-size: 13px;">Your store administrator will review your application. You will be able to sign in once approved.</p>
-        </div>
-      `
-    });
-
-    console.log(`[OTP Service] Registration confirmation email sent to ${maskEmail(email)}.`);
-    return { success: true, configured: true, provider: 'smtp' };
-  } catch (err) {
-    console.error(`[OTP Service] Failed to send confirmation email to ${maskEmail(email)}:`, err.message);
-    return { success: false, configured: true, provider: 'smtp', error: err.message };
-  }
+  return dispatchEmail({ to: email, subject, text, html, purpose: 'registration_confirmation', logLabel: 'Registration Confirmation' });
 }
 
 /**
@@ -237,51 +273,22 @@ async function sendPasswordResetTokenEmail({ email, userId, displayName, resetTo
     testOtpListener({ type: 'email', identifier: email, purpose: 'password_reset_token', userId, resetToken });
   }
 
-  const { email: emailStatus } = getProviderStatus();
-  if (!emailStatus.configured) {
-    return {
-      success: false,
-      configured: false,
-      provider: 'smtp',
-      message: 'SMTP credentials not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
-    };
-  }
+  const subject = 'ASRS Smart Warehouse - Password Reset Approved';
+  const text = `Hello ${displayName || userId},\n\nYour password reset request has been approved by your store administrator.\n\nYour single-use password reset token is: ${resetToken}\n\nThis token is valid for 1 hour. Please complete your password reset in the ASRS dashboard.\n\nThank you,\nASRS Team`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
+      <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
+      <p>Hello <b>${displayName || userId}</b>,</p>
+      <p>Your password reset request has been approved by your store administrator.</p>
+      <p>Your single-use password reset token is:</p>
+      <div style="font-family: monospace; font-size: 18px; font-weight: bold; background: #f1f5f9; padding: 12px; border-radius: 6px; word-break: break-all;">
+        ${resetToken}
+      </div>
+      <p style="color: #64748b; font-size: 13px; margin-top: 14px;">This token expires in 1 hour. Please enter it in the password reset form to set your new password.</p>
+    </div>
+  `;
 
-  try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: process.env.SMTP_SECURE === 'true',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-      }
-    });
-
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || `"ASRS System" <${process.env.SMTP_USER}>`,
-      to: email,
-      subject: 'ASRS Smart Warehouse - Password Reset Approved',
-      text: `Hello ${displayName || userId},\n\nYour password reset request has been approved by your store administrator.\n\nYour single-use password reset token is: ${resetToken}\n\nThis token is valid for 1 hour. Please complete your password reset in the ASRS dashboard.\n\nThank you,\nASRS Team`,
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; color: #222;">
-          <h2 style="color: #2463eb;">ASRS Smart Warehouse</h2>
-          <p>Hello <b>${displayName || userId}</b>,</p>
-          <p>Your password reset request has been approved by your store administrator.</p>
-          <p>Your single-use password reset token is:</p>
-          <div style="font-family: monospace; font-size: 18px; font-weight: bold; background: #f1f5f9; padding: 12px; border-radius: 6px; word-break: break-all;">
-            ${resetToken}
-          </div>
-          <p style="color: #64748b; font-size: 13px; margin-top: 14px;">This token expires in 1 hour. Please enter it in the password reset form to set your new password.</p>
-        </div>
-      `
-    });
-
-    return { success: true, configured: true, provider: 'smtp' };
-  } catch (err) {
-    console.error(`[OTP Service] Failed to send reset token email to ${maskEmail(email)}:`, err.message);
-    return { success: false, configured: true, provider: 'smtp', error: err.message };
-  }
+  return dispatchEmail({ to: email, subject, text, html, purpose: 'password_reset_token', logLabel: 'Password Reset Token' });
 }
 
 /**

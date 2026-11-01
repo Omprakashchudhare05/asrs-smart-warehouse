@@ -241,13 +241,15 @@ app.post('/auth/register/operator', async (q, r) => {
       [cleanId, cleanEmail, 'email', 'operator_registration', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, nowIso, expiresAt]
     );
 
-    // Send email OTP via free SMTP (Requirement F)
+    // Send email OTP via configured provider (Brevo HTTPS / SMTP)
     const emailRes = await otpService.sendEmailOtp({ email: cleanEmail, otp, purpose: 'operator_registration', userId: cleanId });
 
-    if (process.env.NODE_ENV !== 'test' && !emailRes.configured) {
-      return r.status(503).json({
+    if (process.env.NODE_ENV !== 'test' && (!emailRes.configured || !emailRes.success)) {
+      await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'operator_registration' AND verified = 0", [cleanId]);
+      console.error(`[Operator Registration] Email delivery failed for ${otpService.maskEmail(cleanEmail)}:`, emailRes.error || 'Provider delivery error');
+      return r.status(502).json({
         ok: false,
-        error: 'Email delivery failed: SMTP is not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
+        error: 'Registration verification code could not be sent to your email. Please try again or contact administrator.'
       });
     }
 
@@ -363,7 +365,16 @@ app.post('/auth/register/operator/resend', async (q, r) => {
       [user.user_id, user.email, 'email', 'operator_registration', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, (existingOtp?.resend_count || 0) + 1, nowIso, expiresAt]
     );
 
-    await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'operator_registration', userId: user.user_id });
+    const emailRes = await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'operator_registration', userId: user.user_id });
+
+    if (process.env.NODE_ENV !== 'test' && (!emailRes.configured || !emailRes.success)) {
+      await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'operator_registration' AND verified = 0", [user.user_id]);
+      console.error(`[Operator Resend] Email delivery failed for ${otpService.maskEmail(user.email)}:`, emailRes.error || 'Provider delivery error');
+      return r.status(502).json({
+        ok: false,
+        error: 'Resend verification code could not be sent to your email. Please try again.'
+      });
+    }
 
     r.json({
       ok: true,
@@ -722,10 +733,12 @@ const handlePasswordResetRequest = async (q, r) => {
 
       const emailRes = await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'forgot_password', userId: user.user_id });
 
-      if (process.env.NODE_ENV !== 'test' && !emailRes.configured) {
-        return r.status(503).json({
+      if (process.env.NODE_ENV !== 'test' && (!emailRes.configured || !emailRes.success)) {
+        await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password' AND verified = 0", [user.user_id]);
+        console.error(`[Forgot Password] Email delivery failed for ${otpService.maskEmail(user.email)}:`, emailRes.error || 'Provider delivery error');
+        return r.status(502).json({
           ok: false,
-          error: 'Password reset notification could not be delivered. SMTP credentials are not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).',
+          error: 'Password reset verification code could not be delivered to your registered email. Please check email provider configuration or contact administrator.',
           destination: otpService.maskEmail(user.email)
         });
       }
@@ -1016,10 +1029,12 @@ app.post('/auth/profile/request-otp', authenticateUser, async (q, r) => {
     let sendRes;
     if (channel === 'email') {
       sendRes = await otpService.sendEmailOtp({ email: target, otp, purpose: 'profile_verification', userId: user.user_id });
-      if (process.env.NODE_ENV !== 'test' && !sendRes.configured) {
-        return r.status(503).json({
+      if (process.env.NODE_ENV !== 'test' && (!sendRes.configured || !sendRes.success)) {
+        await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'profile_verification' AND verified = 0", [user.user_id]);
+        console.error(`[Profile OTP] Email delivery failed for ${otpService.maskEmail(target)}:`, sendRes.error || 'Provider delivery error');
+        return r.status(502).json({
           ok: false,
-          error: 'SMTP credentials not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
+          error: 'Verification code could not be delivered to the specified email address.'
         });
       }
     } else {

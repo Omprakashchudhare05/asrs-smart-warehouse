@@ -2740,3 +2740,42 @@ test('56. Phase 8.6 Store Admin Dashboard, Roles & Inventory Access (All 12 Requ
   assert.equal(mismatchLogin.status, 403, 'Point 12: Admin selecting boss must be rejected with 403');
   assert.match(mismatchLogin.data.error, /Role mismatch/i);
 });
+
+test('57. Phase 8.23 Brevo HTTPS API, Frontend Countdown & Delivery Error Handling Contracts', async () => {
+  const otpService = require('../otp-service');
+  const appJs = fs.readFileSync(path.join(__dirname, '../../dashboard/app.js'), 'utf8');
+
+  // 1. Frontend Countdown & Resend contracts in dashboard/app.js
+  assert.ok(appJs.includes('function startCountdown('), 'startCountdown function must be defined');
+  assert.ok(appJs.includes('function resendForgotOtp('), 'resendForgotOtp function must be defined');
+  assert.ok(appJs.includes('function clearCountdown('), 'clearCountdown function must be defined');
+  assert.ok(appJs.includes('activeTimers'), 'activeTimers map must be defined');
+
+  // Verify all 4 timer call sites are wired to startCountdown
+  assert.ok(appJs.includes("startCountdown('setupOtpTimer'"), 'Admin setup timer call site must exist');
+  assert.ok(appJs.includes("startCountdown('forgotOtpTimer'"), 'Forgot password timer call site must exist');
+  assert.ok(appJs.includes("startCountdown('opRegOtpTimer'"), 'Operator registration timer call site must exist');
+
+  // 2. Provider status with Brevo HTTPS API
+  const originalKey = process.env.BREVO_API_KEY;
+  try {
+    process.env.BREVO_API_KEY = 'test_brevo_api_key_12345';
+    const statusWithBrevo = otpService.getProviderStatus();
+    assert.equal(statusWithBrevo.email.configured, true);
+    assert.equal(statusWithBrevo.email.provider, 'Brevo HTTPS API');
+
+    delete process.env.BREVO_API_KEY;
+    const statusWithout = otpService.getProviderStatus();
+    assert.match(statusWithout.email.provider, /SMTP/i);
+  } finally {
+    if (originalKey !== undefined) process.env.BREVO_API_KEY = originalKey;
+    else delete process.env.BREVO_API_KEY;
+  }
+
+  // 3. Render configuration contract in render.yaml
+  const renderYaml = fs.readFileSync(path.join(__dirname, '../../render.yaml'), 'utf8');
+  assert.ok(renderYaml.includes('BREVO_API_KEY'), 'render.yaml must declare BREVO_API_KEY');
+  assert.ok(renderYaml.includes('BREVO_SENDER_EMAIL'), 'render.yaml must declare BREVO_SENDER_EMAIL');
+  assert.ok(renderYaml.includes('BREVO_SENDER_NAME'), 'render.yaml must declare BREVO_SENDER_NAME');
+  assert.ok(renderYaml.includes('SMTP_HOST'), 'render.yaml must preserve SMTP_HOST fallback');
+});

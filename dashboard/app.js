@@ -291,7 +291,107 @@ async function init() {
 let pendingRegistrationUserId = '';
 let setupOtpTimerId = null;
 let forgotOtpTimerId = null;
+let opRegOtpTimerId = null;
 let forgotIdentifierTarget = '';
+const activeTimers = {};
+
+function clearCountdown(timerId) {
+  if (activeTimers[timerId]) {
+    clearInterval(activeTimers[timerId]);
+    delete activeTimers[timerId];
+  }
+}
+
+function startCountdown(timerId, btnId, totalSec = 300, cooldownSec = 60, onResend = null) {
+  clearCountdown(timerId);
+
+  const timerEl = $(timerId);
+  const btnEl = $(btnId);
+  if (!timerEl) return null;
+
+  let remainingTotal = totalSec;
+  let remainingCooldown = cooldownSec;
+
+  const updateUI = () => {
+    const mins = Math.floor(remainingTotal / 60);
+    const secs = remainingTotal % 60;
+    timerEl.textContent = `Expires in ${mins}:${secs < 10 ? '0' : ''}${secs}`;
+
+    if (btnEl) {
+      if (remainingCooldown > 0) {
+        btnEl.disabled = true;
+        btnEl.textContent = `Resend Code (${remainingCooldown}s)`;
+      } else {
+        btnEl.disabled = false;
+        btnEl.textContent = 'Resend Code';
+      }
+    }
+  };
+
+  if (btnEl) {
+    btnEl.disabled = true;
+    if (typeof onResend === 'function') {
+      btnEl.onclick = async () => {
+        btnEl.disabled = true;
+        btnEl.textContent = 'Sending...';
+        try {
+          await onResend();
+          // If onResend did not trigger startCountdown itself, restart countdown now
+          if (activeTimers[timerId] === intervalId) {
+            startCountdown(timerId, btnId, totalSec, cooldownSec, onResend);
+          }
+        } catch (err) {
+          if ($('loginError')) $('loginError').textContent = err.message || 'Failed to resend code';
+          btnEl.disabled = false;
+          btnEl.textContent = 'Resend Code';
+        }
+      };
+    }
+  }
+
+  updateUI();
+
+  const intervalId = setInterval(() => {
+    remainingTotal--;
+    if (remainingCooldown > 0) remainingCooldown--;
+
+    if (remainingTotal <= 0) {
+      clearInterval(intervalId);
+      delete activeTimers[timerId];
+      timerEl.textContent = 'Code expired';
+      if (btnEl) {
+        btnEl.disabled = false;
+        btnEl.textContent = 'Resend Code';
+      }
+    } else {
+      updateUI();
+    }
+  }, 1000);
+
+  activeTimers[timerId] = intervalId;
+
+  if (timerId === 'setupOtpTimer') setupOtpTimerId = intervalId;
+  else if (timerId === 'forgotOtpTimer') forgotOtpTimerId = intervalId;
+  else if (timerId === 'opRegOtpTimer') opRegOtpTimerId = intervalId;
+
+  return intervalId;
+}
+
+async function resendForgotOtp() {
+  $('loginError').textContent = '';
+  if (!forgotIdentifierTarget) {
+    throw Error('User ID, Email address or Mobile number is required to resend verification code');
+  }
+  const res = await raw('/auth/forgot-password/request', {
+    method: 'POST',
+    body: JSON.stringify({ identifier: forgotIdentifierTarget })
+  });
+  if ($('forgotDestLabel')) {
+    $('forgotDestLabel').textContent = res.message + (res.destination ? ` (${res.destination})` : '');
+  }
+  startCountdown('forgotOtpTimer', 'forgotResendBtn', 300, 60, resendForgotOtp);
+  toast(res.message || 'Verification code resent to your registered email.');
+}
 
 async function setup() {
   try {
@@ -552,6 +652,7 @@ function setupRegistrationHandlers() {
       $('loginTitle').textContent = 'Welcome back';
       $('loginHint').textContent = 'Sign in to your warehouse control center.';
       $('loginError').textContent = '';
+      clearCountdown('opRegOtpTimer');
     };
   });
 
@@ -634,6 +735,7 @@ function setupRegistrationHandlers() {
         });
 
         toast(res.message);
+        clearCountdown('opRegOtpTimer');
         $('opRegFields').classList.add('hidden');
         $('loginFields').classList.remove('hidden');
         $('enterBtn').classList.remove('hidden');

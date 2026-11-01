@@ -25,6 +25,13 @@ services:
         sync: false
       - key: SMTP_FROM
         sync: false
+      # Optional Email Provider (Brevo HTTPS REST API - Port 443 / Render Free Tier Compatible)
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_SENDER_EMAIL
+        sync: false
+      - key: BREVO_SENDER_NAME
+        sync: false
       # Optional SMS Provider (Twilio or Gateway)
       - key: TWILIO_ACCOUNT_SID
         sync: false
