@@ -22,7 +22,7 @@
     <h1 id="loginTitle">Welcome back</h1>
     <p id="loginHint">Sign in to your warehouse control center.</p>
     <div class="role-choice" id="roleChoice">
-      <button type="button" class="role active" data-role="boss">♛ &nbsp; Boss</button>
+      <button type="button" class="role" data-role="boss">♛ &nbsp; Boss</button>
       <button type="button" class="role" data-role="admin">♚ &nbsp; Admin</button>
       <button type="button" class="role" data-role="operator">⚙ &nbsp; Operator</button>
     </div>
@@ -251,10 +251,15 @@
     i.type = i.type === 'password' ? 'text' : 'password';
     b.textContent = i.type === 'password' ? 'Show' : 'Hide';
   }));
-  let chosenRole = 'boss';
+  let chosenRole = '';
   document.querySelectorAll('.role').forEach(b => b.addEventListener('click', () => {
-    chosenRole = b.dataset.role;
-    document.querySelectorAll('.role').forEach(x => x.classList.toggle('active', x === b));
+    if (chosenRole === b.dataset.role) {
+      chosenRole = '';
+      b.classList.remove('active');
+    } else {
+      chosenRole = b.dataset.role;
+      document.querySelectorAll('.role').forEach(x => x.classList.toggle('active', x === b));
+    }
   }));
   window.getChosenRole = () => chosenRole;
 

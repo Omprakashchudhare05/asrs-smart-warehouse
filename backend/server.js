@@ -28,7 +28,7 @@ const hash = (p, s) => crypto.scryptSync(p, s, 64).toString('hex');
 
 function getUserRole(u) {
   if (!u) return 'anonymous';
-  if (u.user_id === 'testboss' || u.effective_role === 'owner') return 'owner';
+  if (String(u.user_id || '').toLowerCase() === 'testboss' || u.effective_role === 'owner') return 'owner';
   if (u.effective_role === 'admin' || (u.requested_role === 'admin' && u.role === 'boss')) return 'admin';
   if (u.effective_role === 'operator' || u.role === 'operator') return 'operator';
   if (u.role === 'boss') return 'owner';
@@ -746,14 +746,14 @@ const handlePasswordResetRequest = async (q, r) => {
 
     // Route Operator / Store Admin to relevant Store Owner / Store Admin (Requirement E.4)
     const mem = await db.get(
-      "SELECT store_id, role FROM store_memberships WHERE user_id = ? AND status = 'active' ORDER BY id ASC LIMIT 1",
+      "SELECT store_id, role FROM store_memberships WHERE LOWER(user_id) = LOWER(?) AND status = 'active' ORDER BY id ASC LIMIT 1",
       [user.user_id]
     );
     const targetStoreId = mem?.store_id || 'store_default_001';
 
     // Prevent duplicate pending requests within cooldown
     const existingReq = await db.get(
-      "SELECT id, requested_at FROM password_reset_requests WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+      "SELECT id, requested_at FROM password_reset_requests WHERE LOWER(user_id) = LOWER(?) AND status = 'pending' ORDER BY id DESC LIMIT 1",
       [user.user_id]
     );
     if (existingReq) {
@@ -1180,7 +1180,7 @@ app.post('/auth/login', async (q, r) => {
     // Verify selected role against account's actual role (Requirement A.2 & A.3)
     if (selectedRole) {
       const cleanRole = String(selectedRole).trim().toLowerCase();
-      const isBossRole = (resolvedRole === 'owner' || resolvedRole === 'boss' || u.role === 'boss' || u.platform_role === 'platform_owner' || u.user_id === 'testboss');
+      const isBossRole = (resolvedRole === 'owner' || resolvedRole === 'boss' || u.platform_role === 'platform_owner' || String(u.user_id || '').toLowerCase() === 'testboss' || (u.role === 'boss' && u.effective_role !== 'admin'));
       const isAdminRole = (resolvedRole === 'admin' || (u.role === 'boss' && u.effective_role === 'admin'));
       const isOperatorRole = (resolvedRole === 'operator' || u.role === 'operator');
 
@@ -1257,7 +1257,7 @@ async function authenticateUser(q, r, next) {
            u.id as user_db_id, u.active, u.approval_status, u.role as db_role,
            u.effective_role, u.requested_role, u.display_name as db_display_name
     FROM user_sessions s
-    JOIN users u ON s.user_id = u.user_id
+    JOIN users u ON LOWER(s.user_id) = LOWER(u.user_id)
     WHERE s.token = ?
   `, [token]);
 
@@ -1267,7 +1267,7 @@ async function authenticateUser(q, r, next) {
 
   // Active and approval status verification on every request
   if (Number(session.active) !== 1 || (session.approval_status && session.approval_status !== 'approved')) {
-    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [session.user_id]);
+    await db.run('DELETE FROM user_sessions WHERE LOWER(user_id) = LOWER(?)', [session.user_id]);
     const errorMsg = session.approval_status === 'pending'
       ? 'Your account is pending administrator approval.'
       : session.approval_status === 'rejected'
@@ -1283,8 +1283,8 @@ async function authenticateUser(q, r, next) {
     requested_role: session.requested_role
   });
 
-  const fullUser = await db.get("SELECT platform_role FROM users WHERE user_id = ?", [session.user_id]);
-  const isPlatformOwner = fullUser?.platform_role === 'platform_owner' || session.user_id === 'testboss';
+  const fullUser = await db.get("SELECT platform_role FROM users WHERE LOWER(user_id) = LOWER(?)", [session.user_id]);
+  const isPlatformOwner = fullUser?.platform_role === 'platform_owner' || String(session.user_id || '').toLowerCase() === 'testboss';
 
   q.user = {
     userId: session.user_id,
@@ -1297,7 +1297,7 @@ async function authenticateUser(q, r, next) {
 
 // Platform Owner Only Middleware
 function platformOwnerOnly(q, r, next) {
-  if (q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss') {
+  if (q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss') {
     return next();
   }
   return r.status(403).json({ ok: false, error: 'Platform Owner permission required' });
@@ -1305,7 +1305,7 @@ function platformOwnerOnly(q, r, next) {
 
 // Server-Side Tenant Isolation Middleware (SEC-01 & SEC-05 enforced)
 async function tenantContext(q, r, next) {
-  const isPlatformOwner = q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+  const isPlatformOwner = q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
 
   // SEC-05: Check for conflicting store identifiers across params, headers, query, and body
   const candidates = [];
@@ -1323,7 +1323,7 @@ async function tenantContext(q, r, next) {
 
   if (!targetStoreId) {
     const userMemberships = await db.all(
-      "SELECT m.store_id, m.role, s.name, s.status as store_status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active' ORDER BY m.id ASC",
+      "SELECT m.store_id, m.role, s.name, s.status as store_status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE LOWER(m.user_id) = LOWER(?) AND m.status = 'active' AND s.status = 'active' ORDER BY m.id ASC",
       [q.user.userId]
     );
 
@@ -1354,7 +1354,7 @@ async function tenantContext(q, r, next) {
 
   // SEC-01: Strict server-side membership verification with ZERO dynamic auto-enrollment
   const membership = await db.get(
-    "SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ? AND status = 'active'",
+    "SELECT * FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = LOWER(?) AND status = 'active'",
     [targetStoreId, q.user.userId]
   );
 
@@ -1432,10 +1432,10 @@ function bossOnly(q, r, next) {
 // Current User Profile Endpoint
 app.get('/auth/me', authenticateUser, async (q, r) => {
   try {
-    const u = await db.get('SELECT * FROM users WHERE user_id = ?', [q.user.userId]);
+    const u = await db.get('SELECT * FROM users WHERE LOWER(user_id) = LOWER(?)', [q.user.userId]);
     if (!u) return r.status(404).json({ ok: false, error: 'User not found' });
     const userStores = await db.all(
-      "SELECT s.id, s.name, s.code, s.store_type, m.role, m.status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active' ORDER BY s.name ASC",
+      "SELECT s.id, s.name, s.code, s.store_type, m.role, m.status FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE LOWER(m.user_id) = LOWER(?) AND m.status = 'active' AND s.status = 'active' ORDER BY s.name ASC",
       [q.user.userId]
     );
     const safe = safeUser(u);
@@ -1615,13 +1615,13 @@ const handleStoreApply = async (q, r) => {
     const salt = crypto.randomBytes(16).toString('hex');
     const passwordHash = hash(password, salt);
 
-    // Create pending user (role=boss for legacy compatibility, effective_role=admin, requested_role=admin)
+    // Create pending user (role=boss for legacy compatibility, effective_role=owner, requested_role=owner)
     await db.run(`
       INSERT INTO users (
         user_id, password_hash, salt, display_name, role, active,
         email, phone, approval_status, requested_role, effective_role,
         organization, registration_reason, requested_at
-      ) VALUES (?, ?, ?, ?, 'boss', 0, ?, ?, 'pending', 'admin', 'admin', ?, ?, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, 'boss', 0, ?, ?, 'pending', 'owner', 'owner', ?, ?, CURRENT_TIMESTAMP)
     `, [
       cleanUserId,
       passwordHash,
@@ -2254,7 +2254,7 @@ app.get('/api/admin/operators', tenantContext, storeAdminOnly, async (q, r) => {
       SELECT u.id, u.user_id, u.display_name, u.email, u.phone, u.organization, u.employee_id, u.active,
              u.approval_status, u.requested_at, u.reviewed_at, u.reviewed_by, u.created_at, u.role, u.effective_role, u.requested_role
       FROM store_memberships m
-      JOIN users u ON m.user_id = u.user_id
+      JOIN users u ON LOWER(m.user_id) = LOWER(u.user_id)
       WHERE m.store_id = ? AND (m.role = 'operator' OR u.role = 'operator' OR u.effective_role = 'operator')
         AND u.approval_status = 'approved'
       ORDER BY u.id DESC
@@ -2274,14 +2274,14 @@ app.post('/api/admin/operators/:id/deactivate', tenantContext, storeAdminOnly, a
     if (targetRole !== 'operator') {
       return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
     }
-    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = LOWER(?)', [q.storeId, u.user_id]);
     if (!mem) {
       return r.status(404).json({ ok: false, error: 'Operator account not found in this store' });
     }
 
     await db.run('UPDATE users SET active = 0, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
-    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
-    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [u.user_id]);
+    await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [q.storeId, u.user_id]);
+    await db.run('DELETE FROM user_sessions WHERE LOWER(user_id) = LOWER(?)', [u.user_id]);
     r.json({ ok: true, message: `Operator '${u.user_id}' has been deactivated. All active sessions have been revoked.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
@@ -2297,13 +2297,13 @@ app.post('/api/admin/operators/:id/activate', tenantContext, storeAdminOnly, asy
     if (targetRole !== 'operator') {
       return r.status(403).json({ ok: false, error: 'Admins can only manage Operators' });
     }
-    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = LOWER(?)', [q.storeId, u.user_id]);
     if (!mem) {
       return r.status(404).json({ ok: false, error: 'Operator account not found in this store' });
     }
 
     await db.run('UPDATE users SET active = 1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?', [q.user.userId, id]);
-    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
+    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [q.storeId, u.user_id]);
     r.json({ ok: true, message: `Operator '${u.user_id}' has been activated.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
@@ -2313,7 +2313,7 @@ app.post('/api/admin/operators/:id/activate', tenantContext, storeAdminOnly, asy
 // User Management (Admin & Owner - Tenant Scoped SEC-02)
 app.get('/users', tenantContext, adminOnly, async (q, r) => {
   try {
-    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
     let users;
     if (isOwner) {
       users = await db.all(`
@@ -2321,7 +2321,7 @@ app.get('/users', tenantContext, adminOnly, async (q, r) => {
                u.approval_status, u.email, u.phone, u.employee_id, u.organization, u.created_at,
                u.requested_at, u.reviewed_at, u.reviewed_by
         FROM store_memberships m
-        JOIN users u ON m.user_id = u.user_id
+        JOIN users u ON LOWER(m.user_id) = LOWER(u.user_id)
         WHERE m.store_id = ?
         ORDER BY u.id
       `, [q.storeId]);
@@ -2332,7 +2332,7 @@ app.get('/users', tenantContext, adminOnly, async (q, r) => {
                u.approval_status, u.email, u.phone, u.employee_id, u.organization, u.created_at,
                u.requested_at, u.reviewed_at, u.reviewed_by
         FROM store_memberships m
-        JOIN users u ON m.user_id = u.user_id
+        JOIN users u ON LOWER(m.user_id) = LOWER(u.user_id)
         WHERE m.store_id = ? AND (m.role = 'operator' OR u.role = 'operator' OR u.effective_role = 'operator')
         ORDER BY u.id
       `, [q.storeId]);
@@ -2420,17 +2420,17 @@ app.patch('/users/:id', tenantContext, adminOnly, async (q, r) => {
     const targetRole = getUserRole(u);
 
     // Prevent modifying Owner (testboss)
-    if (targetRole === 'owner' || u.user_id === 'testboss') {
+    if (targetRole === 'owner' || String(u.user_id || '').toLowerCase() === 'testboss') {
       return r.status(403).json({ ok: false, error: 'Cannot modify Owner account via this endpoint' });
     }
 
     // Must be member of caller's store
-    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?', [q.storeId, u.user_id]);
+    const mem = await db.get('SELECT * FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = LOWER(?)', [q.storeId, u.user_id]);
     if (!mem) {
       return r.status(404).json({ ok: false, error: 'User not found in this store' });
     }
 
-    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isOwner = ['owner', 'boss'].includes(q.user.role) || q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
 
     // Admins can ONLY modify operators
     if (!isOwner && targetRole !== 'operator' && mem.role !== 'operator') {
@@ -2443,27 +2443,27 @@ app.patch('/users/:id', tenantContext, adminOnly, async (q, r) => {
     }
     if (active !== undefined) {
       const activeVal = active ? 1 : 0;
-      if (activeVal === 0 && u.user_id === q.user.userId && isOwner) {
-        const ownerCount = await db.get("SELECT COUNT(*) as n FROM users WHERE (user_id='testboss' OR role='boss' OR effective_role='owner') AND active=1 AND id != ?", [id]);
+      if (activeVal === 0 && String(u.user_id || '').toLowerCase() === String(q.user.userId || '').toLowerCase() && isOwner) {
+        const ownerCount = await db.get("SELECT COUNT(*) as n FROM users WHERE (LOWER(user_id)='testboss' OR role='boss' OR effective_role='owner') AND active=1 AND id != ?", [id]);
         if (Number(ownerCount?.n || 0) === 0) {
           return r.status(400).json({ ok: false, error: 'Cannot deactivate the only active Owner account' });
         }
       }
       await db.run('UPDATE users SET active=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [activeVal, q.user.userId, id]);
       if (activeVal === 0) {
-        await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
+        await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [q.storeId, u.user_id]);
         // Immediate session revocation on deactivation!
-        await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
+        await db.run('DELETE FROM user_sessions WHERE LOWER(user_id) = LOWER(?)', [u.user_id]);
       } else {
-        await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
+        await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [q.storeId, u.user_id]);
       }
     }
     if (approvalStatus !== undefined) {
       if (isOwner || targetRole === 'operator') {
         await db.run('UPDATE users SET approval_status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?', [approvalStatus, q.user.userId, id]);
         if (approvalStatus !== 'approved') {
-          await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND user_id = ?", [q.storeId, u.user_id]);
-          await db.run('DELETE FROM user_sessions WHERE user_id=?', [u.user_id]);
+          await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [q.storeId, u.user_id]);
+          await db.run('DELETE FROM user_sessions WHERE LOWER(user_id) = LOWER(?)', [u.user_id]);
         }
       }
     }
@@ -2488,7 +2488,7 @@ app.patch('/users/:id', tenantContext, adminOnly, async (q, r) => {
 // User Active Stores List
 app.get('/api/user/stores', async (q, r) => {
   try {
-    const isPlatformOwner = q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isPlatformOwner = q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
     let stores;
     if (isPlatformOwner) {
       stores = await db.all(`
@@ -2501,7 +2501,7 @@ app.get('/api/user/stores', async (q, r) => {
         SELECT s.id, s.name, s.code, s.slug, s.store_type, s.status, s.rack_rows, s.rack_cols, m.role
         FROM store_memberships m
         JOIN stores s ON m.store_id = s.id
-        WHERE m.user_id = ? AND m.status = 'active' AND s.status = 'active'
+        WHERE LOWER(m.user_id) = LOWER(?) AND m.status = 'active' AND s.status = 'active'
         ORDER BY s.name ASC
       `, [q.user.userId]);
     }
@@ -2533,7 +2533,7 @@ app.get('/api/platform/pending-stores', platformOwnerOnly, async (q, r) => {
     const pending = await db.all(`
       SELECT s.*, u.display_name as owner_name, u.email as owner_email, u.phone as owner_phone, u.requested_at
       FROM stores s
-      LEFT JOIN users u ON s.owner_user_id = u.user_id
+      LEFT JOIN users u ON LOWER(s.owner_user_id) = LOWER(u.user_id)
       WHERE s.status = 'pending'
       ORDER BY s.created_at ASC
     `);
@@ -2557,13 +2557,13 @@ app.post('/api/platform/stores/:id/approve', platformOwnerOnly, async (q, r) => 
     await db.run('UPDATE stores SET status = ? WHERE id = ?', ['active', storeId]);
 
     // 2. Activate store owner membership
-    await db.run("UPDATE store_memberships SET status = 'active' WHERE store_id = ? AND user_id = ?", [storeId, store.owner_user_id]);
+    await db.run("UPDATE store_memberships SET status = 'active', role = 'store_owner' WHERE store_id = ? AND LOWER(user_id) = LOWER(?)", [storeId, store.owner_user_id]);
 
-    // 3. Activate store owner user account
+    // 3. Activate store owner user account (set effective_role = 'owner', requested_role = 'owner')
     await db.run(`
       UPDATE users
-      SET active = 1, approval_status = 'approved', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
-      WHERE user_id = ?
+      SET active = 1, approval_status = 'approved', effective_role = 'owner', requested_role = 'owner', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?
+      WHERE LOWER(user_id) = LOWER(?)
     `, [q.user.userId, store.owner_user_id]);
 
     // 4. Initialize default rack slots (A1-D4) if none exist
@@ -2697,7 +2697,7 @@ app.post('/api/platform/stores/:id/activate', platformOwnerOnly, async (q, r) =>
 // Store Staff: List store members (Hierarchy: Operator=403, Admin=Operators only, Owner=All)
 app.get('/api/stores/:storeId/members', tenantContext, async (q, r) => {
   try {
-    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
     const isAdmin = q.storeRole === 'store_admin';
 
     if (!isOwnerOrPlatform && !isAdmin) {
@@ -2710,7 +2710,7 @@ app.get('/api/stores/:storeId/members', tenantContext, async (q, r) => {
         SELECT m.id, m.store_id, m.user_id, m.role, m.status, m.created_at,
                u.display_name, u.email, u.phone, u.employee_id, u.active
         FROM store_memberships m
-        JOIN users u ON m.user_id = u.user_id
+        JOIN users u ON LOWER(m.user_id) = LOWER(u.user_id)
         WHERE m.store_id = ?
         ORDER BY m.id DESC
       `, [q.storeId]);
@@ -2720,7 +2720,7 @@ app.get('/api/stores/:storeId/members', tenantContext, async (q, r) => {
         SELECT m.id, m.store_id, m.user_id, m.role, m.status, m.created_at,
                u.display_name, u.email, u.phone, u.employee_id, u.active
         FROM store_memberships m
-        JOIN users u ON m.user_id = u.user_id
+        JOIN users u ON LOWER(m.user_id) = LOWER(u.user_id)
         WHERE m.store_id = ? AND m.role = 'operator'
         ORDER BY m.id DESC
       `, [q.storeId]);
@@ -2735,7 +2735,7 @@ app.get('/api/stores/:storeId/members', tenantContext, async (q, r) => {
 // Store Staff: Add new staff member or link existing user to store
 app.post('/api/stores/:storeId/members', tenantContext, async (q, r) => {
   try {
-    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
     const isAdmin = q.storeRole === 'store_admin';
 
     if (!isOwnerOrPlatform && !isAdmin) {
@@ -2771,7 +2771,7 @@ app.post('/api/stores/:storeId/members', tenantContext, async (q, r) => {
     if (existingUser) {
       // User already exists in database: check existing store membership
       const existingMembership = await db.get(
-        'SELECT * FROM store_memberships WHERE store_id = ? AND user_id = ?',
+        'SELECT * FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = LOWER(?)',
         [q.storeId, existingUser.user_id]
       );
 
@@ -2853,7 +2853,7 @@ app.post('/api/stores/:storeId/members/:memberId/deactivate', tenantContext, asy
 
     const memberParam = q.params.memberId;
     const member = await db.get(
-      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR user_id = ?)',
+      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR LOWER(user_id) = LOWER(?))',
       [q.storeId, Number(memberParam) || -1, memberParam]
     );
 
@@ -2867,9 +2867,9 @@ app.post('/api/stores/:storeId/members/:memberId/deactivate', tenantContext, asy
     }
 
     // Self-lockout protection for sole Store Owner
-    if (member.user_id === q.user.userId && member.role === 'store_owner') {
+    if (String(member.user_id).toLowerCase() === String(q.user.userId).toLowerCase() && member.role === 'store_owner') {
       const otherOwners = await db.get(
-        "SELECT COUNT(*) as n FROM store_memberships WHERE store_id = ? AND role = 'store_owner' AND status = 'active' AND user_id != ?",
+        "SELECT COUNT(*) as n FROM store_memberships WHERE store_id = ? AND role = 'store_owner' AND status = 'active' AND LOWER(user_id) != LOWER(?)",
         [q.storeId, q.user.userId]
       );
       if (Number(otherOwners?.n || 0) === 0) {
@@ -2880,7 +2880,7 @@ app.post('/api/stores/:storeId/members/:memberId/deactivate', tenantContext, asy
     await db.run("UPDATE store_memberships SET status = 'deactivated' WHERE id = ?", [member.id]);
 
     // Invalidate sessions for that user
-    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [member.user_id]);
+    await db.run('DELETE FROM user_sessions WHERE LOWER(user_id) = LOWER(?)', [member.user_id]);
 
     await db.run(`
       INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details)
@@ -2896,7 +2896,7 @@ app.post('/api/stores/:storeId/members/:memberId/deactivate', tenantContext, asy
 // Store Staff: Activate a member
 app.post('/api/stores/:storeId/members/:memberId/activate', tenantContext, async (q, r) => {
   try {
-    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || q.user?.userId === 'testboss';
+    const isOwnerOrPlatform = q.storeRole === 'store_owner' || q.user?.platformRole === 'platform_owner' || String(q.user?.userId || '').toLowerCase() === 'testboss';
     const isAdmin = q.storeRole === 'store_admin';
 
     if (!isOwnerOrPlatform && !isAdmin) {
@@ -2905,7 +2905,7 @@ app.post('/api/stores/:storeId/members/:memberId/activate', tenantContext, async
 
     const memberParam = q.params.memberId;
     const member = await db.get(
-      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR user_id = ?)',
+      'SELECT * FROM store_memberships WHERE store_id = ? AND (id = ? OR LOWER(user_id) = LOWER(?))',
       [q.storeId, Number(memberParam) || -1, memberParam]
     );
 

@@ -39,12 +39,12 @@ const menus = {
     ['approvals', '✓', 'Approval Queue'],
     ['admin_mgmt', '♟', 'Admin Management'],
     ['users', '👥', 'User Management'],
-    ['settings', '⚙', 'Settings & Hardware'],
     ['profile', '👤', 'My Profile']
   ],
   admin: [
     ['dashboard', '▣', 'Dashboard'],
     ['inventory', '▤', 'Warehouse Inventory'],
+    ['rack', '▦', 'Rack Slots'],
     ['history', '◷', 'History & Export'],
     ['store_staff', '👥', 'Store Staff'],
     ['store_devices', '📱', 'Store Devices'],
@@ -69,6 +69,23 @@ function getCurrentStoreRole() {
   if (activeStore && activeStore.role) return activeStore.role;
   if (me && me.role) return me.role;
   return 'operator';
+}
+
+function isStoreOwner() {
+  if (isPlatformOwner) return true;
+  const role = getCurrentStoreRole();
+  return ['store_owner', 'owner', 'boss', 'platform_owner'].includes(role);
+}
+
+function isStoreAdmin() {
+  if (isStoreOwner()) return true;
+  const role = getCurrentStoreRole();
+  return ['store_admin', 'admin'].includes(role);
+}
+
+function isFloorOperator() {
+  const role = getCurrentStoreRole();
+  return role === 'operator';
 }
 
 function formatStoreType(t) {
@@ -716,14 +733,17 @@ function setupStoreRegHandlers() {
 
 async function login() {
   try {
-    const selectedRole = (typeof window.getChosenRole === 'function' ? window.getChosenRole() : 'boss');
+    const selectedRole = (typeof window.getChosenRole === 'function' ? window.getChosenRole() : '');
+    const loginPayload = {
+      userId: $('loginUser').value.trim(),
+      password: $('loginPass').value
+    };
+    if (selectedRole) {
+      loginPayload.selectedRole = selectedRole;
+    }
     const d = await raw('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({
-        userId: $('loginUser').value.trim(),
-        password: $('loginPass').value,
-        selectedRole
-      })
+      body: JSON.stringify(loginPayload)
     });
     token = d.token;
     me = d.user;
@@ -794,9 +814,9 @@ function buildMobileNav() {
     mobileTabs = [
       ['dashboard', '▣', 'Dashboard'],
       ['inventory', '▤', 'Inventory'],
+      ['rack', '▦', 'Rack'],
       ['history', '◷', 'History'],
-      ['store_staff', '👥', 'Staff'],
-      ['profile', '👤', 'Profile']
+      ['store_staff', '👥', 'Staff']
     ];
   } else {
     mobileTabs = [
@@ -885,36 +905,36 @@ async function load() {
         console.error('Failed to load store devices:', err);
       }
     }
-    if (page === 'users' && (me.role === 'owner' || me.role === 'boss')) {
+    if (page === 'users' && isStoreAdmin()) {
       try { users = await api('/users'); } catch {}
     }
-    if (page === 'admin_mgmt' && (me.role === 'owner' || me.role === 'boss')) {
+    if (page === 'admin_mgmt' && isStoreOwner()) {
       try {
         const resA = await api('/api/owner/admins');
         approvedAdminsList = resA.admins || [];
       } catch {}
     }
-    if (page === 'operator_mgmt' && (me.role === 'admin' || me.role === 'owner' || me.role === 'boss')) {
+    if (page === 'operator_mgmt' && isStoreAdmin()) {
       try {
         const resO = await api('/api/admin/operators');
         approvedOpsList = resO.operators || [];
       } catch {}
     }
     if (page === 'approvals') {
-      if (me.role === 'owner' || me.role === 'boss' || isPlatformOwner) {
+      if (isStoreOwner()) {
         try {
           const resA = await api('/api/owner/pending-admins');
           pendingAdminsList = resA.requests || [];
         } catch {}
       }
-      if (me.role === 'owner' || me.role === 'boss' || me.role === 'admin' || isPlatformOwner) {
+      if (isStoreAdmin()) {
         try {
           const resO = await api('/api/admin/pending-operators');
           pendingOpsList = resO.requests || [];
         } catch {}
       }
     }
-    if (page === 'settings' && (me.role === 'owner' || me.role === 'boss' || isPlatformOwner)) {
+    if (page === 'settings' && isPlatformOwner) {
       try {
         const hw = await api('/hardware/key');
         hardwareKey = hw.hardwareApiKey;
@@ -1026,7 +1046,7 @@ function dashboard() {
     <div class="page-actions">
       <div>
         <b>Live Warehouse Overview</b>
-        <div class="muted">${me.role === 'boss' ? 'Live monitoring of inventory occupancy and automated movements.' : 'Operator control for stock operations and slot monitoring.'}</div>
+        <div class="muted">${isStoreOwner() ? 'Live monitoring of inventory occupancy and automated movements.' : 'Operator control for stock operations and slot monitoring.'}</div>
       </div>
       <button class="primary" id="refresh">↻ Refresh</button>
     </div>
@@ -1131,7 +1151,7 @@ function inventory() {
                 <td>${s.capacity}</td>
                 <td><span class="badge ${s.quantity === 0 ? 'red' : s.quantity >= s.capacity ? 'orange' : 'green'}">${s.status}</span></td>
                 <td>
-                  ${me.role === 'operator' ? `
+                  ${isFloorOperator() ? `
                     <button class="ghost action" data-action="store" data-slot="${s.slot}">📥 Store</button>
                     <button class="ghost action" data-action="retrieve" data-slot="${s.slot}">📤 Retrieve</button>
                   ` : `
@@ -1184,7 +1204,7 @@ function historyPage() {
     <div class="panel">
       <div class="panel-head">
         <div>
-          <h3>${me.role === 'operator' ? 'My Movement History' : 'Warehouse Transaction History'}</h3>
+          <h3>${isFloorOperator() ? 'My Movement History' : 'Warehouse Transaction History'}</h3>
           <span class="muted">Total Logged: ${transactions.length} record(s)${txFromFilter || txToFilter ? ` (Filtered: ${txFromFilter || 'Earliest'} to ${txToFilter || 'Latest'})` : ''}</span>
         </div>
         <div style="display:flex;gap:10px;">
@@ -1385,7 +1405,7 @@ function settings() {
 }
 
 function usersPage() {
-  const isOwner = me.role === 'owner' || me.role === 'boss';
+  const isOwner = isStoreOwner();
   return `
     <div class="grid two">
       <div class="panel">
@@ -1442,7 +1462,7 @@ function usersPage() {
 }
 
 function approvalsPage() {
-  const isOwner = me.role === 'owner' || me.role === 'boss';
+  const isOwner = isStoreOwner();
   return `
     <div class="page-actions">
       <div>
@@ -2486,7 +2506,7 @@ function wire() {
 
   // Slot clicks & actions
   document.querySelectorAll('.slot').forEach(x => x.onclick = () => {
-    if (me.role === 'operator') {
+    if (isFloorOperator()) {
       openMove(x.dataset.slot);
     } else {
       toast(`Slot ${x.dataset.slot} selected. Stock movements are reserved for Operators.`);
@@ -2690,7 +2710,7 @@ function wire() {
   // Create user
   $('createOp')?.addEventListener('click', async () => {
     try {
-      const isOwner = me.role === 'owner' || me.role === 'boss';
+      const isOwner = isStoreOwner();
       const role = isOwner ? ($('newRoleSelect')?.value || 'operator') : 'operator';
       await api('/users', {
         method: 'POST',
@@ -2731,8 +2751,8 @@ function wire() {
 }
 
 function openMove(code, action = 'store') {
-  if (me.role !== 'operator') {
-    toast(`Movement operations are restricted to approved Operators. You are signed in as ${me.displayName} (${roleLabels[me.role] || me.role}).`, true);
+  if (!isFloorOperator()) {
+    toast(`Movement operations are restricted to approved Operators. You are signed in as ${me.displayName} (${roleLabels[getCurrentStoreRole()] || me.role}).`, true);
     return;
   }
   let s = slots.find(x => x.slot === code);

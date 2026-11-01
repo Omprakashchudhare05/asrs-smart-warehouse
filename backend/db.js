@@ -584,8 +584,8 @@ async function initDb() {
   }
 
   // Ensure testboss has platform_owner and store_owner in default store
-  await run("UPDATE users SET platform_role = 'platform_owner', effective_role = 'owner' WHERE user_id = 'testboss' AND (platform_role IS NULL OR platform_role = '' OR effective_role IS NULL)");
-  const testbossMember = await get("SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND user_id = 'testboss'");
+  await run("UPDATE users SET platform_role = 'platform_owner', effective_role = 'owner' WHERE LOWER(user_id) = 'testboss' AND (platform_role IS NULL OR platform_role = '' OR effective_role IS NULL)");
+  const testbossMember = await get("SELECT * FROM store_memberships WHERE store_id = 'store_default_001' AND LOWER(user_id) = 'testboss'");
   if (!testbossMember) {
     await run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', 'testboss', 'store_owner', 'active')");
   }
@@ -595,14 +595,29 @@ async function initDb() {
     SELECT u.user_id, u.role, u.effective_role
     FROM users u
     WHERE u.active = 1
-      AND NOT EXISTS (SELECT 1 FROM store_memberships m WHERE m.user_id = u.user_id)
+      AND NOT EXISTS (SELECT 1 FROM store_memberships m WHERE LOWER(m.user_id) = LOWER(u.user_id))
   `);
   for (const u of unassignedLegacyUsers) {
     let mRole = 'operator';
-    if (u.user_id === 'testboss' || u.role === 'boss' || u.effective_role === 'owner') mRole = 'store_owner';
-    else if (u.effective_role === 'admin' || (u.role === 'boss' && u.effective_role === 'admin')) mRole = 'store_admin';
+    if (u.user_id === 'testboss' || u.effective_role === 'owner') {
+      mRole = 'store_owner';
+    } else if (u.effective_role === 'admin') {
+      mRole = 'store_admin';
+    } else if (u.role === 'boss') {
+      mRole = 'store_owner';
+    }
     await run("INSERT INTO store_memberships (store_id, user_id, role, status) VALUES ('store_default_001', ?, ?, 'active')", [u.user_id, mRole]);
   }
+
+  // Idempotent migration: Align store admins mistakenly assigned 'store_owner' membership role (e.g. SUR2026)
+  await run(`
+    UPDATE store_memberships
+    SET role = 'store_admin'
+    WHERE role = 'store_owner'
+      AND LOWER(user_id) != 'testboss'
+      AND LOWER(user_id) IN (SELECT LOWER(user_id) FROM users WHERE effective_role = 'admin')
+      AND store_id NOT IN (SELECT id FROM stores WHERE LOWER(owner_user_id) = LOWER(store_memberships.user_id))
+  `);
 
   // Ensure rack_config default exists
   const existingRack = await get('SELECT * FROM rack_config WHERE id=1');

@@ -1386,15 +1386,21 @@ test('27. Role-Specific Navigation Menu Contracts & Client-Side Privilege Isolat
   assert.ok(appJs.includes("admin_mgmt', '♟', 'Admin Management'"), 'Owner menu must include Admin Management');
   assert.ok(appJs.includes("operator_mgmt', '♟', 'Operator Management'"), 'Admin menu must include Operator Management');
   
-  // Verify Admin menu does not include Owner-only options
+  // Verify Admin menu contract
   const adminMenuMatch = appJs.match(/admin:\s*\[([\s\S]*?)\],\s*operator:/);
   assert.ok(adminMenuMatch, 'Admin menu must be defined');
   const adminMenuStr = adminMenuMatch[1];
   assert.ok(!adminMenuStr.includes('admin_mgmt'), 'Admin menu must NOT contain Admin Management');
-  assert.ok(!adminMenuStr.includes("'rack'"), 'Admin menu must NOT contain Rack Configuration');
+  assert.ok(adminMenuStr.includes("'rack'"), 'Admin menu must contain Rack Slots (Phase 8.6)');
   assert.ok(!adminMenuStr.includes('settings'), 'Admin menu must NOT contain Settings & Hardware');
   assert.ok(!adminMenuStr.includes("'store'"), 'Admin menu must NOT contain Store Stock');
   assert.ok(!adminMenuStr.includes("'retrieve'"), 'Admin menu must NOT contain Retrieve Stock');
+
+  // Verify Store Owner menu contract (Phase 8.6: settings reserved for platform_owner)
+  const ownerMenuMatch = appJs.match(/\bowner:\s*\[([\s\S]*?)\],\s*admin:/);
+  assert.ok(ownerMenuMatch, 'Owner menu must be defined');
+  const ownerMenuStr = ownerMenuMatch[1];
+  assert.ok(!ownerMenuStr.includes('settings'), 'Store Owner menu must NOT contain Settings & Hardware (Phase 8.6)');
 
   // Verify Operator menu does not include Management options
   const opMenuMatch = appJs.match(/operator:\s*\[([\s\S]*?)\]\s*\};/);
@@ -2553,4 +2559,181 @@ test('55. Phase 8 Free SMTP Email Configuration and Zero-Cost Contract (Requirem
   });
   assert.equal(typeof resetTokenResult.configured, 'boolean');
   assert.equal(typeof resetTokenResult.success, 'boolean');
+});
+
+test('56. Phase 8.6 Store Admin Dashboard, Roles & Inventory Access (All 12 Requirements)', async () => {
+  const crypto = require('crypto');
+  const hash = (p, s) => crypto.scryptSync(p, s, 64).toString('hex');
+
+  // 1. initDb legacy backfill role priority:
+  // Provision a legacy user with role='boss', effective_role='admin', no store membership
+  await db.run("DELETE FROM users WHERE LOWER(user_id) = 'legacy_adm_test'");
+  await db.run("DELETE FROM store_memberships WHERE LOWER(user_id) = 'legacy_adm_test'");
+  const testLegacySalt = crypto.randomBytes(16).toString('hex');
+  const testLegacyPass = hash('LegacyAdminPass123!', testLegacySalt);
+  await db.run(`
+    INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, effective_role, requested_role)
+    VALUES ('legacy_adm_test', ?, ?, 'Legacy Admin Test', 'boss', 1, 'approved', 'admin', 'admin')
+  `, [testLegacyPass, testLegacySalt]);
+
+  // Re-run db.initDb() to trigger the backfill and alignment
+  await db.initDb();
+
+  const legacyMem = await db.get("SELECT role, status FROM store_memberships WHERE LOWER(user_id) = 'legacy_adm_test' AND store_id = 'store_default_001'");
+  assert.ok(legacyMem, 'Legacy admin should have been backfilled');
+  assert.equal(legacyMem.role, 'store_admin', 'Point 1: Legacy user with role=boss, effective_role=admin MUST map to store_admin');
+
+  // 2. initDb alignment migration:
+  // Simulate an admin like SUR2026 whose membership was erroneously set to store_owner
+  const surSalt = crypto.randomBytes(16).toString('hex');
+  const surPass = hash('SamyakPass123!', surSalt);
+  const existingSur = await db.get("SELECT id FROM users WHERE LOWER(user_id) = 'sur2026'");
+  if (existingSur) {
+    await db.run(`
+      UPDATE users
+      SET password_hash = ?, salt = ?, role = 'boss', active = 1, approval_status = 'approved', effective_role = 'admin', requested_role = 'admin'
+      WHERE id = ?
+    `, [surPass, surSalt, existingSur.id]);
+  } else {
+    await db.run(`
+      INSERT INTO users (user_id, password_hash, salt, display_name, role, active, approval_status, effective_role, requested_role)
+      VALUES ('SUR2026', ?, ?, 'Samyak Shambharkar', 'boss', 1, 'approved', 'admin', 'admin')
+    `, [surPass, surSalt]);
+  }
+
+  // Force store_owner membership to simulate the pre-migration state on production
+  const existingSurMem = await db.get("SELECT id FROM store_memberships WHERE LOWER(user_id) = 'sur2026' AND store_id = 'store_default_001'");
+  if (existingSurMem) {
+    await db.run("UPDATE store_memberships SET role = 'store_owner', status = 'active' WHERE id = ?", [existingSurMem.id]);
+  } else {
+    await db.run(`
+      INSERT INTO store_memberships (store_id, user_id, role, status)
+      VALUES ('store_default_001', 'SUR2026', 'store_owner', 'active')
+    `);
+  }
+
+  // Run initDb migration
+  await db.initDb();
+
+  const alignedSurMem = await db.get("SELECT role FROM store_memberships WHERE LOWER(user_id) = 'sur2026' AND store_id = 'store_default_001'");
+  assert.equal(alignedSurMem.role, 'store_admin', 'Point 2: Idempotent migration must align SUR2026 role to store_admin');
+
+  // 3. testboss platform_owner & store_owner integrity:
+  const bossUser = await db.get("SELECT platform_role, effective_role FROM users WHERE LOWER(user_id) = 'testboss'");
+  assert.equal(bossUser.platform_role, 'platform_owner', 'Point 3: testboss platform_role must be platform_owner');
+  assert.equal(bossUser.effective_role, 'owner', 'Point 3: testboss effective_role must be owner');
+  const bossMem = await db.get("SELECT role FROM store_memberships WHERE LOWER(user_id) = 'testboss' AND store_id = 'store_default_001'");
+  assert.equal(bossMem.role, 'store_owner', 'Point 3: testboss membership role must be store_owner');
+
+  // 4. Store applicant provisioning with owner roles:
+  const newStoreCode = 'STR_' + Date.now().toString(36).toUpperCase();
+  const applyRes = await api('/api/stores/apply', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({
+      name: 'SuperMart Test',
+      code: newStoreCode,
+      ownerUserId: 'owner_' + newStoreCode.toLowerCase(),
+      ownerName: 'SuperMart Owner',
+      email: `owner_${newStoreCode.toLowerCase()}@test.com`,
+      password: 'StorePassword123!'
+    })
+  });
+  assert.equal(applyRes.status, 200, 'Store application should succeed');
+  const appliedUser = await db.get("SELECT requested_role, effective_role, role, approval_status FROM users WHERE LOWER(user_id) = ?", ['owner_' + newStoreCode.toLowerCase()]);
+  assert.equal(appliedUser.effective_role, 'owner', 'Point 4: New store applicant effective_role must be owner');
+  assert.equal(appliedUser.requested_role, 'owner', 'Point 4: New store applicant requested_role must be owner');
+  assert.equal(appliedUser.approval_status, 'pending');
+
+  // 5. Store approval by platform owner:
+  const approveRes = await api(`/api/platform/stores/${applyRes.data.storeId}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(approveRes.status, 200, 'Platform owner store approval should succeed');
+  const approvedUser = await db.get("SELECT active, approval_status, effective_role, platform_role FROM users WHERE LOWER(user_id) = ?", ['owner_' + newStoreCode.toLowerCase()]);
+  assert.equal(approvedUser.active, 1);
+  assert.equal(approvedUser.approval_status, 'approved');
+  assert.equal(approvedUser.effective_role, 'owner', 'Point 5: Approved store owner effective_role must be owner');
+  assert.equal(approvedUser.platform_role || null, null, 'Point 5: Approved store owner MUST NOT have platform_role');
+  const approvedMem = await db.get("SELECT role, status FROM store_memberships WHERE store_id = ? AND LOWER(user_id) = ?", [applyRes.data.storeId, 'owner_' + newStoreCode.toLowerCase()]);
+  assert.equal(approvedMem.role, 'store_owner', 'Point 5: Membership role must be store_owner');
+  assert.equal(approvedMem.status, 'active');
+
+  // 6. Case-insensitive lookup in tenantContext:
+  // Log in as SUR2026 with lowercase user ID 'sur2026'
+  const surLogin = await api('/auth/login', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({ userId: 'sur2026', password: 'SamyakPass123!' })
+  });
+  assert.equal(surLogin.status, 200, 'Login with lowercase sur2026 should succeed');
+  const surToken = surLogin.data.token;
+  assert.equal(surLogin.data.user.role, 'admin');
+
+  // Query tenantContext-protected /slots endpoint with surToken
+  const slotsRes = await api('/slots', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${surToken}` }
+  });
+  assert.equal(slotsRes.status, 200, 'Point 6: tenantContext case-insensitive lookup allows slot query');
+  assert.ok(Array.isArray(slotsRes.data) && slotsRes.data.length > 0, 'SUR2026 must see slots');
+
+  // 7. Case-insensitive lookup in /api/user/stores:
+  const storesRes = await api('/api/user/stores', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${surToken}` }
+  });
+  assert.equal(storesRes.status, 200);
+  assert.ok(Array.isArray(storesRes.data.stores) && storesRes.data.stores.length > 0, 'Point 7: /api/user/stores returns stores case-insensitively');
+  assert.equal(storesRes.data.stores[0].role, 'store_admin');
+
+  // 8. Store Admin menu contract in dashboard/app.js:
+  const appJs = fs.readFileSync(path.join(__dirname, '../../dashboard/app.js'), 'utf8');
+  const adminMatch = appJs.match(/admin:\s*\[([\s\S]*?)\],\s*operator:/);
+  assert.ok(adminMatch);
+  const adminMenu = adminMatch[1];
+  assert.ok(adminMenu.includes("['rack', '▦', 'Rack Slots']"), 'Point 8: Admin menu must include Rack Slots');
+  assert.ok(adminMenu.includes("['inventory', '▤', 'Warehouse Inventory']"), 'Point 8: Admin menu must include Inventory');
+  assert.ok(adminMenu.includes("['history', '◷', 'History & Export']"), 'Point 8: Admin menu must include History');
+  assert.ok(adminMenu.includes("['store_staff', '👥', 'Store Staff']"), 'Point 8: Admin menu must include Store Staff');
+  assert.ok(adminMenu.includes("['store_devices', '📱', 'Store Devices']"), 'Point 8: Admin menu must include Store Devices');
+  assert.ok(adminMenu.includes("['operator_mgmt', '♟', 'Operator Management']"), 'Point 8: Admin menu must include Operator Management');
+  assert.ok(!adminMenu.includes('admin_mgmt'), 'Point 8: Admin menu must NOT include admin_mgmt');
+  assert.ok(!adminMenu.includes('settings'), 'Point 8: Admin menu must NOT include settings');
+
+  // 9. Store Owner menu contract in dashboard/app.js:
+  const ownerMatch = appJs.match(/\bowner:\s*\[([\s\S]*?)\],\s*admin:/);
+  assert.ok(ownerMatch);
+  const ownerMenu = ownerMatch[1];
+  assert.ok(!ownerMenu.includes('settings'), 'Point 9: Store Owner menu must NOT contain settings');
+
+  // 10. Role selection buttons in dashboard/index.html have NO hardcoded active class:
+  const indexHtml = fs.readFileSync(path.join(__dirname, '../../dashboard/index.html'), 'utf8');
+  assert.ok(!indexHtml.includes('class="role active"'), 'Point 10: index.html must not hardcode class="role active"');
+
+  // 11. Login without selecting a role succeeds for Admin without 403:
+  const unselectedLogin = await api('/auth/login', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({ userId: 'SUR2026', password: 'SamyakPass123!' })
+  });
+  assert.equal(unselectedLogin.status, 200, 'Point 11: Login without role selection succeeds');
+  assert.equal(unselectedLogin.data.user.role, 'admin');
+
+  // 12. Login with role selection: matches succeeds, mismatch returns 403:
+  const matchLogin = await api('/auth/login', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({ userId: 'SUR2026', password: 'SamyakPass123!', selectedRole: 'admin' })
+  });
+  assert.equal(matchLogin.status, 200, 'Point 12: Login with matching selectedRole=admin succeeds');
+
+  const mismatchLogin = await api('/auth/login', {
+    method: 'POST',
+    headers: {},
+    body: JSON.stringify({ userId: 'SUR2026', password: 'SamyakPass123!', selectedRole: 'boss' })
+  });
+  assert.equal(mismatchLogin.status, 403, 'Point 12: Admin selecting boss must be rejected with 403');
+  assert.match(mismatchLogin.data.error, /Role mismatch/i);
 });
