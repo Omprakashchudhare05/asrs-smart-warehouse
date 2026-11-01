@@ -1411,8 +1411,11 @@ test('27. Role-Specific Navigation Menu Contracts & Client-Side Privilege Isolat
   assert.ok(!opMenuStr.includes('approvals'), 'Operator menu must NOT contain Approvals');
   assert.ok(!opMenuStr.includes("'rack'"), 'Operator menu must NOT contain Rack Configuration');
   assert.ok(!opMenuStr.includes('settings'), 'Operator menu must NOT contain Settings & Hardware');
-  assert.ok(opMenuStr.includes("'store'"), 'Operator menu must contain Store Stock');
-  assert.ok(opMenuStr.includes("'retrieve'"), 'Operator menu must contain Retrieve Stock');
+  assert.ok(opMenuStr.includes("'inventory'"), 'Operator menu must contain Inventory (Phase 8.16)');
+  assert.ok(!opMenuStr.includes("'store'"), 'Operator menu must NOT contain separate Store Stock (Phase 8.16)');
+  assert.ok(!opMenuStr.includes("'retrieve'"), 'Operator menu must NOT contain separate Retrieve Stock (Phase 8.16)');
+  const opMenuItems = opMenuStr.trim().split(/\n/).filter(l => l.includes('['));
+  assert.equal(opMenuItems.length, 4, 'Operator menu must contain exactly 4 navigation items (Phase 8.16)');
 });
 
 test('28. Public Store Application Onboarding: validates input, prevents duplicate codes, and creates pending store', async () => {

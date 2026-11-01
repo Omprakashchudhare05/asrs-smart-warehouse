@@ -3,6 +3,7 @@ let token = '', me = null, slots = [], transactions = [], users = [], page = 'da
 let rackConfig = { rows: 4, cols: 4 };
 let hardwareKey = '';
 let inventoryFilter = '', historyFilter = '';
+let operatorStoreSlot = '', operatorStoreQty = 1, operatorRetSlot = '', operatorRetQty = 1;
 let refreshInterval = null;
 
 // Multi-Tenant SaaS State
@@ -53,9 +54,7 @@ const menus = {
   ],
   operator: [
     ['dashboard', '▣', 'Dashboard'],
-    ['store', '📥', 'Store Stock'],
-    ['retrieve', '📤', 'Retrieve Stock'],
-    ['inventory', '▤', 'Inventory Search'],
+    ['inventory', '▤', 'Inventory'],
     ['history', '◷', 'My Movements'],
     ['profile', '👤', 'My Profile']
   ]
@@ -832,8 +831,7 @@ function buildMobileNav() {
     mobileTabs = [
       ['dashboard', '▣', 'Dashboard'],
       ['inventory', '▤', 'Inventory'],
-      ['store', '📥', 'Store'],
-      ['retrieve', '📤', 'Retrieve'],
+      ['history', '◷', 'Movements'],
       ['profile', '👤', 'Profile']
     ];
   }
@@ -1118,6 +1116,153 @@ function inventory() {
       (s.status || '').toLowerCase().includes(f)
     );
   }
+
+  if (isFloorOperator()) {
+    const availableSlots = slots.filter(s => Number(s.quantity || 0) < Number(s.capacity || 10));
+    const stockSlots = slots.filter(s => Number(s.quantity || 0) > 0);
+    const selectedStore = operatorStoreSlot && availableSlots.some(s => s.slot === operatorStoreSlot)
+      ? operatorStoreSlot
+      : (availableSlots[0]?.slot || '');
+    const selectedRet = operatorRetSlot && stockSlots.some(s => s.slot === operatorRetSlot)
+      ? operatorRetSlot
+      : (stockSlots[0]?.slot || '');
+
+    const storeOptions = availableSlots.map(s => {
+      const free = Number(s.capacity || 10) - Number(s.quantity || 0);
+      const isSel = s.slot === selectedStore ? 'selected' : '';
+      return '<option value="' + s.slot + '" ' + isSel + '>' + s.slot + ' — ' + esc(s.item_name) + ' (' + s.quantity + '/' + s.capacity + ' in stock, ' + free + ' space free)</option>';
+    }).join('') || '<option value="">No available slots with free capacity</option>';
+
+    const retOptions = stockSlots.map(s => {
+      const isSel = s.slot === selectedRet ? 'selected' : '';
+      return '<option value="' + s.slot + '" ' + isSel + '>' + s.slot + ' — ' + esc(s.item_name) + ' (' + s.quantity + ' unit(s) available)</option>';
+    }).join('') || '<option value="">No slots with available stock</option>';
+
+    const tableRows = list.map(s => {
+      const sStored = transactions.filter(t => t.slot === s.slot && t.action === 'STORE').reduce((a, t) => a + Number(t.quantity || 1), 0);
+      const sRetrieved = transactions.filter(t => t.slot === s.slot && t.action === 'RETRIEVE').reduce((a, t) => a + Number(t.quantity || 1), 0);
+      const badgeCls = s.quantity === 0 ? 'red' : s.quantity >= s.capacity ? 'orange' : 'green';
+      return '<tr>' +
+        '<td><b>' + s.slot + '</b></td>' +
+        '<td>' + esc(s.item_name) + '</td>' +
+        '<td><span class="muted">' + esc(s.sku) + '</span></td>' +
+        '<td><b class="cyan">' + s.quantity + '</b></td>' +
+        '<td><span class="muted">' + sStored + '</span></td>' +
+        '<td><span class="muted">' + sRetrieved + '</span></td>' +
+        '<td>' + s.capacity + '</td>' +
+        '<td><span class="badge ' + badgeCls + '">' + s.status + '</span></td>' +
+        '<td>' +
+          '<button class="ghost action" data-action="store" data-slot="' + s.slot + '">📥 Store</button> ' +
+          '<button class="ghost action" data-action="retrieve" data-slot="' + s.slot + '">📤 Retrieve</button>' +
+        '</td>' +
+      '</tr>';
+    }).join('') || '<tr><td colspan="9" style="text-align:center;padding:24px;" class="muted">No matching inventory items found</td></tr>';
+
+    return `
+      <div class="page-actions">
+        <div>
+          <b>Warehouse Inventory & Stock Operations</b>
+          <div class="muted">Combined Operator Center: Store new stock, retrieve inventory items, and search rack capacity with instant validation.</div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button class="primary" id="refresh">↻ Refresh</button>
+        </div>
+      </div>
+      ` + stats() + `
+      <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-top: 16px;">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>📥 Store Stock (Operator Movement)</h3>
+              <span class="muted">Store products into available warehouse rack slots</span>
+            </div>
+            <span class="badge" style="background:#e0f2fe;color:#0369a1;">Simulation Mode</span>
+          </div>
+          <p class="muted">Select target rack slot and specify quantity to store items safely into warehouse storage.</p>
+          <div class="form">
+            <label for="storeSlotSelect">Select Target Slot *</label>
+            <select id="storeSlotSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+              ` + storeOptions + `
+            </select>
+
+            <label for="storeQtyInput" style="margin-top:12px;">Quantity to Store *</label>
+            <input id="storeQtyInput" type="number" min="1" max="50" value="` + (operatorStoreQty || 1) + `">
+
+            <div class="actions" style="margin-top:16px;">
+              <button class="primary wide" id="execStoreBtn">Execute Store Movement →</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>📤 Retrieve Stock (Operator Movement)</h3>
+              <span class="muted">Pick and retrieve products from stocked warehouse slots</span>
+            </div>
+            <span class="badge" style="background:#fef3c7;color:#92400e;">Simulation Mode</span>
+          </div>
+          <p class="muted">Select rack slot and specify quantity to pick and retrieve items from warehouse storage.</p>
+          <div class="form">
+            <label for="retSlotSelect">Select Stock Slot *</label>
+            <select id="retSlotSelect" class="search" style="width:100%;max-width:none;padding:12px;">
+              ` + retOptions + `
+            </select>
+
+            <label for="retQtyInput" style="margin-top:12px;">Quantity to Retrieve *</label>
+            <input id="retQtyInput" type="number" min="1" max="50" value="` + (operatorRetQty || 1) + `">
+
+            <div class="actions" style="margin-top:16px;">
+              <button class="primary wide" id="execRetBtn">Execute Retrieve Movement →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:16px;">
+        <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+          <div>
+            <h3>🔍 Inventory Search & Current Stock</h3>
+            <span class="muted">Current rack inventory, real-time stock levels, and quick movement triggers</span>
+          </div>
+          <div>
+            <input class="search" id="invSearchInput" placeholder="🔍 Search slot, product, SKU..." value="` + esc(inventoryFilter) + `" style="min-width:240px;">
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Location</th>
+                <th>Product Name</th>
+                <th>SKU</th>
+                <th>Stock</th>
+                <th>Stored</th>
+                <th>Retrieved</th>
+                <th>Capacity</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ` + tableRows + `
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:16px;">
+        <div class="panel-head">
+          <div>
+            <h3>◷ Recent Operator Movements</h3>
+            <span class="muted">My movement activity & transaction attribution</span>
+          </div>
+        </div>
+        ` + activity(6) + `
+      </div>
+    `;
+  }
+
   return `
     <div class="page-actions">
       <div>
@@ -2524,15 +2669,49 @@ function wire() {
   });
   document.querySelectorAll('.action').forEach(b => b.onclick = () => openMove(b.dataset.slot, b.dataset.action));
 
-  // Operator direct movement page buttons
+  // Operator direct movement page buttons & inputs
+  $('storeSlotSelect')?.addEventListener('change', e => {
+    operatorStoreSlot = e.target.value;
+    const s = slots.find(x => x.slot === e.target.value);
+    if (s && $('storeQtyInput')) {
+      const free = Math.max(1, Number(s.capacity || 10) - Number(s.quantity || 0));
+      $('storeQtyInput').max = free;
+    }
+  });
+
+  $('storeQtyInput')?.addEventListener('input', e => {
+    operatorStoreQty = Number(e.target.value || 1);
+  });
+
+  $('retSlotSelect')?.addEventListener('change', e => {
+    operatorRetSlot = e.target.value;
+    const s = slots.find(x => x.slot === e.target.value);
+    if (s && $('retQtyInput')) {
+      const avail = Math.max(1, Number(s.quantity || 0));
+      $('retQtyInput').max = avail;
+    }
+  });
+
+  $('retQtyInput')?.addEventListener('input', e => {
+    operatorRetQty = Number(e.target.value || 1);
+  });
+
   $('execStoreBtn')?.addEventListener('click', async () => {
     const slot = $('storeSlotSelect')?.value;
     const qty = Number($('storeQtyInput')?.value || 1);
     if (!slot) return toast('Please select a valid slot', true);
+    if (isNaN(qty) || qty < 1) return toast('Quantity must be at least 1', true);
+    const targetSlot = slots.find(s => s.slot === slot);
+    if (targetSlot) {
+      const free = Number(targetSlot.capacity || 10) - Number(targetSlot.quantity || 0);
+      if (qty > free) {
+        return toast(`Cannot store ${qty} unit(s). Slot ${slot} only has space for ${free} unit(s).`, true);
+      }
+    }
     try {
       await api('/store', {
         method: 'POST',
-        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard' })
+        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard_operator_simulated' })
       });
       toast(`Successfully stored ${qty} unit(s) into slot ${slot}`);
       await load();
@@ -2545,10 +2724,18 @@ function wire() {
     const slot = $('retSlotSelect')?.value;
     const qty = Number($('retQtyInput')?.value || 1);
     if (!slot) return toast('Please select a valid slot', true);
+    if (isNaN(qty) || qty < 1) return toast('Quantity must be at least 1', true);
+    const targetSlot = slots.find(s => s.slot === slot);
+    if (targetSlot) {
+      const avail = Number(targetSlot.quantity || 0);
+      if (qty > avail) {
+        return toast(`Cannot retrieve ${qty} unit(s). Slot ${slot} only has ${avail} unit(s) available.`, true);
+      }
+    }
     try {
       await api('/retrieve', {
         method: 'POST',
-        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard' })
+        body: JSON.stringify({ slot, quantity: qty, source: 'dashboard_operator_simulated' })
       });
       toast(`Successfully retrieved ${qty} unit(s) from slot ${slot}`);
       await load();
