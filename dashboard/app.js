@@ -14,6 +14,7 @@ let platformStoresList = [];
 let platformPendingStoresList = [];
 let storeMembersList = [];
 let storeDevicesList = [];
+let storePasswordResetsList = [];
 
 const $ = id => document.getElementById(id);
 
@@ -396,21 +397,40 @@ function setupForgotPassHandlers() {
         const id = $('forgotIdentifier').value.trim();
         if (!id) throw Error('Enter your User ID, Email address or Mobile number');
         sendBtn.disabled = true;
-        sendBtn.textContent = 'Sending code...';
+        sendBtn.textContent = 'Sending request...';
         const res = await raw('/auth/forgot-password/request', {
           method: 'POST',
           body: JSON.stringify({ identifier: id })
         });
+
         forgotIdentifierTarget = id;
+
+        if (res.requiresApproval) {
+          $('forgotStep1').classList.add('hidden');
+          $('forgotStepApproval').classList.remove('hidden');
+          if ($('forgotApprovalMsg')) $('forgotApprovalMsg').textContent = res.message;
+          const haveTokenBtn = $('forgotHaveTokenBtn');
+          if (haveTokenBtn) {
+            haveTokenBtn.onclick = () => {
+              $('forgotStepApproval').classList.add('hidden');
+              $('forgotStep2').classList.remove('hidden');
+              $('forgotDestLabel').textContent = 'Enter the approved reset token provided by your administrator:';
+              if ($('forgotResendRow')) $('forgotResendRow').classList.add('hidden');
+            };
+          }
+          return;
+        }
+
         $('forgotStep1').classList.add('hidden');
         $('forgotStep2').classList.remove('hidden');
+        if ($('forgotResendRow')) $('forgotResendRow').classList.remove('hidden');
         $('forgotDestLabel').textContent = res.message + (res.destination ? ` (${res.destination})` : '');
         startCountdown('forgotOtpTimer', 'forgotResendBtn', 300, 60, resendForgotOtp);
       } catch (err) {
         $('loginError').textContent = err.message;
       } finally {
         sendBtn.disabled = false;
-        sendBtn.textContent = 'Send Verification Code →';
+        sendBtn.textContent = 'Send Reset Request →';
       }
     };
   }
@@ -422,7 +442,7 @@ function setupForgotPassHandlers() {
         const otp = $('forgotOtp').value.trim();
         const newPass = $('forgotNewPass').value;
         const confirmPass = $('forgotConfirmPass').value;
-        if (!otp) throw Error('Enter the 6-digit verification code');
+        if (!otp) throw Error('Enter the 6-digit verification code or reset token');
         if (!newPass || newPass.length < 8) throw Error('New password must have at least 8 characters');
         if (newPass !== confirmPass) throw Error('Passwords do not match');
 
@@ -433,6 +453,7 @@ function setupForgotPassHandlers() {
           body: JSON.stringify({
             identifier: forgotIdentifierTarget,
             otp,
+            resetToken: otp,
             newPassword: newPass
           })
         });
@@ -453,83 +474,33 @@ function setupForgotPassHandlers() {
   }
 }
 
-async function resendForgotOtp() {
+async function loadPublicStores() {
   try {
-    $('loginError').textContent = '';
-    const res = await raw('/auth/forgot-password/request', {
-      method: 'POST',
-      body: JSON.stringify({ identifier: forgotIdentifierTarget })
-    });
-    $('loginError').textContent = res.message;
-    startCountdown('forgotOtpTimer', 'forgotResendBtn', 300, 60, resendForgotOtp);
-  } catch (err) {
-    $('loginError').textContent = err.message;
-  }
-}
-
-function startCountdown(timerId, btnId, totalSec, cooldownSec, resendCallback) {
-  const timerEl = $(timerId);
-  const btnEl = $(btnId);
-  if (!timerEl || !btnEl) return;
-
-  btnEl.disabled = true;
-  let remaining = totalSec;
-  let cooldown = cooldownSec;
-
-  btnEl.onclick = () => {
-    if (!btnEl.disabled && resendCallback) resendCallback();
-  };
-
-  const intervalId = setInterval(() => {
-    remaining--;
-    cooldown--;
-
-    const m = Math.floor(remaining / 60);
-    const s = remaining % 60;
-    timerEl.textContent = remaining > 0 ? `Expires in ${m}:${String(s).padStart(2, '0')}` : 'Code expired';
-
-    if (cooldown > 0) {
-      btnEl.textContent = `Resend in ${cooldown}s`;
-      btnEl.disabled = true;
+    const res = await raw('/auth/stores');
+    const storeSel = $('opRegStore');
+    if (!storeSel) return;
+    if (res.stores && res.stores.length) {
+      storeSel.innerHTML = res.stores.map(s => `<option value="${s.id}">${esc(s.name)} (${esc(s.code || s.id)})</option>`).join('');
     } else {
-      btnEl.textContent = 'Resend Code';
-      btnEl.disabled = false;
+      storeSel.innerHTML = '<option value="">No active stores available</option>';
     }
-
-    if (remaining <= 0) {
-      clearInterval(intervalId);
-      timerEl.textContent = 'Code expired. Request a new one.';
-    }
-  }, 1000);
-
-  if (timerId === 'setupOtpTimer') {
-    if (setupOtpTimerId) clearInterval(setupOtpTimerId);
-    setupOtpTimerId = intervalId;
-  } else {
-    if (forgotOtpTimerId) clearInterval(forgotOtpTimerId);
-    forgotOtpTimerId = intervalId;
+  } catch (e) {
+    if ($('opRegStore')) $('opRegStore').innerHTML = '<option value="">Failed to load stores</option>';
   }
 }
-
-const roleLabels = {
-  owner: 'Owner / Super Admin',
-  boss: 'Owner / Super Admin',
-  admin: 'Admin / Warehouse Manager',
-  operator: 'Warehouse Operator'
-};
 
 function setupRegistrationHandlers() {
   const opLink = $('opRegLink');
-  const adminLink = $('adminRegLink');
   const backLinks = document.querySelectorAll('.regBackLink');
 
   if (opLink) {
-    opLink.onclick = (e) => {
+    opLink.onclick = async (e) => {
       e.preventDefault();
       $('loginFields').classList.add('hidden');
       $('forgotFields').classList.add('hidden');
-      $('adminRegFields').classList.add('hidden');
       $('opRegFields').classList.remove('hidden');
+      $('opRegFormStep')?.classList.remove('hidden');
+      $('opRegOtpStep')?.classList.add('hidden');
       $('enterBtn').classList.add('hidden');
       $('roleChoice')?.classList.add('hidden');
       $('loginNote')?.classList.add('hidden');
@@ -537,23 +508,7 @@ function setupRegistrationHandlers() {
       $('loginTitle').textContent = 'Apply for Operator Access';
       $('loginHint').textContent = 'Submit your application for warehouse operator access.';
       $('loginError').textContent = '';
-    };
-  }
-
-  if (adminLink) {
-    adminLink.onclick = (e) => {
-      e.preventDefault();
-      $('loginFields').classList.add('hidden');
-      $('forgotFields').classList.add('hidden');
-      $('opRegFields').classList.add('hidden');
-      $('adminRegFields').classList.remove('hidden');
-      $('enterBtn').classList.add('hidden');
-      $('roleChoice')?.classList.add('hidden');
-      $('loginNote')?.classList.add('hidden');
-      $('loginFooterLinks')?.classList.add('hidden');
-      $('loginTitle').textContent = 'Apply for Admin Access';
-      $('loginHint').textContent = 'Submit your application for warehouse manager access.';
-      $('loginError').textContent = '';
+      await loadPublicStores();
     };
   }
 
@@ -561,7 +516,7 @@ function setupRegistrationHandlers() {
     b.onclick = (e) => {
       e.preventDefault();
       $('opRegFields').classList.add('hidden');
-      $('adminRegFields').classList.add('hidden');
+      $('storeRegFields')?.classList.add('hidden');
       $('forgotFields').classList.add('hidden');
       $('loginFields').classList.remove('hidden');
       $('enterBtn').classList.remove('hidden');
@@ -584,17 +539,38 @@ function setupRegistrationHandlers() {
         const password = $('opRegPass').value;
         const email = $('opRegEmail').value.trim();
         const phone = $('opRegPhone').value.trim();
-        const employeeId = $('opRegEmpId').value.trim();
-        const registrationReason = $('opRegReason').value.trim();
+        const storeId = $('opRegStore')?.value || '';
 
-        if (!userId || !displayName || !password) throw Error('User ID, Display Name, and Password (8+ chars) are required');
+        if (!userId || !displayName || !password) throw Error('User ID, Full Name, and Password (8+ chars) are required');
+        if (!email) throw Error('A valid email address is mandatory for registration');
+        if (!phone) throw Error('A valid mobile phone number is mandatory for registration');
+        if (!storeId) throw Error('Please select an active store');
+
         opSubmitBtn.disabled = true;
         opSubmitBtn.textContent = 'Submitting application...';
 
         const res = await raw('/auth/register/operator', {
           method: 'POST',
-          body: JSON.stringify({ userId, displayName, password, email, phone, employeeId, registrationReason })
+          body: JSON.stringify({ userId, displayName, password, email, phone, storeId })
         });
+
+        if (res.step === 'verify_otp') {
+          $('opRegFormStep').classList.add('hidden');
+          $('opRegOtpStep').classList.remove('hidden');
+          $('opRegOtpDesc').textContent = `Verification code sent to ${res.emailMasked || email}. Valid for 5 minutes.`;
+          startCountdown('opRegOtpTimer', 'opRegResendBtn', 300, 60, async () => {
+            try {
+              await raw('/auth/register/operator/resend', {
+                method: 'POST',
+                body: JSON.stringify({ userId })
+              });
+              toast('New verification code sent');
+            } catch (e) {
+              toast(e.message, true);
+            }
+          });
+          return;
+        }
 
         toast(res.message);
         $('opRegFields').classList.add('hidden');
@@ -615,43 +591,38 @@ function setupRegistrationHandlers() {
     };
   }
 
-  const adminSubmitBtn = $('adminRegSubmitBtn');
-  if (adminSubmitBtn) {
-    adminSubmitBtn.onclick = async () => {
+  const opVerifyBtn = $('opRegVerifyBtn');
+  if (opVerifyBtn) {
+    opVerifyBtn.onclick = async () => {
       try {
         $('loginError').textContent = '';
-        const userId = $('adminRegUser').value.trim();
-        const displayName = $('adminRegName').value.trim();
-        const password = $('adminRegPass').value;
-        const email = $('adminRegEmail').value.trim();
-        const phone = $('adminRegPhone').value.trim();
-        const organization = $('adminRegOrg').value.trim();
-        const registrationReason = $('adminRegReason').value.trim();
+        const userId = $('opRegUser').value.trim();
+        const otp = $('opRegOtp').value.trim();
+        if (!otp) throw Error('Please enter the 6-digit email verification code');
+        opVerifyBtn.disabled = true;
+        opVerifyBtn.textContent = 'Verifying...';
 
-        if (!userId || !displayName || !password || !email) throw Error('User ID, Full Name, Password (8+ chars), and Email are required');
-        adminSubmitBtn.disabled = true;
-        adminSubmitBtn.textContent = 'Submitting application...';
-
-        const res = await raw('/auth/register/admin', {
+        const res = await raw('/auth/register/operator/verify', {
           method: 'POST',
-          body: JSON.stringify({ userId, displayName, password, email, phone, organization, registrationReason })
+          body: JSON.stringify({ userId, otp })
         });
 
         toast(res.message);
-        $('adminRegFields').classList.add('hidden');
+        $('opRegFields').classList.add('hidden');
         $('loginFields').classList.remove('hidden');
         $('enterBtn').classList.remove('hidden');
         $('roleChoice')?.classList.remove('hidden');
         $('loginNote')?.classList.remove('hidden');
         $('loginFooterLinks')?.classList.remove('hidden');
-        $('loginTitle').textContent = 'Application Submitted';
-        $('loginHint').textContent = 'Your admin application is pending Owner / Super Admin approval.';
-        $('loginError').textContent = res.message;
+        $('loginTitle').textContent = 'Registration Submitted';
+        $('loginHint').textContent = 'Your application has been submitted to your store administrator.';
+        $('loginUser').value = userId;
+        $('loginPass').value = '';
       } catch (err) {
         $('loginError').textContent = err.message;
       } finally {
-        adminSubmitBtn.disabled = false;
-        adminSubmitBtn.textContent = 'Submit Admin Application →';
+        opVerifyBtn.disabled = false;
+        opVerifyBtn.textContent = 'Verify Email & Complete Registration →';
       }
     };
   }
@@ -745,11 +716,13 @@ function setupStoreRegHandlers() {
 
 async function login() {
   try {
+    const selectedRole = (typeof window.getChosenRole === 'function' ? window.getChosenRole() : 'boss');
     const d = await raw('/auth/login', {
       method: 'POST',
       body: JSON.stringify({
         userId: $('loginUser').value.trim(),
-        password: $('loginPass').value
+        password: $('loginPass').value,
+        selectedRole
       })
     });
     token = d.token;
@@ -894,10 +867,14 @@ async function load() {
     }
     if (page === 'store_staff' && activeStoreId) {
       try {
-        const res = await api(`/api/stores/${activeStoreId}/members`);
-        storeMembersList = res.members || [];
+        const [mRes, rRes] = await Promise.all([
+          api(`/api/stores/${activeStoreId}/members`),
+          api(`/api/stores/${activeStoreId}/password-resets`).catch(() => ({ requests: [] }))
+        ]);
+        storeMembersList = mRes.members || [];
+        storePasswordResetsList = rRes.requests || [];
       } catch (err) {
-        console.error('Failed to load store members:', err);
+        console.error('Failed to load store members or reset requests:', err);
       }
     }
     if (page === 'store_devices' && activeStoreId) {
@@ -1950,6 +1927,53 @@ function storeStaffPage() {
         </div>
       </div>
     </div>
+
+    <!-- OPERATOR PASSWORD RESET REQUESTS -->
+    <div class="panel" style="margin-top:20px;">
+      <div class="panel-head">
+        <div>
+          <h3>Operator Password Reset Requests (${storePasswordResetsList.filter(r => r.status === 'pending').length} Pending)</h3>
+          <span class="muted">Operator in-app password recovery requests requiring Store Owner or Admin authorization.</span>
+        </div>
+      </div>
+      <div style="margin-top:14px; overflow-x: auto;">
+        ${storePasswordResetsList.length ? `
+          <table class="data-table" style="width:100%;text-align:left;border-collapse:collapse;">
+            <thead>
+              <tr style="border-bottom:2px solid #e2e8f0;font-size:12px;color:#64748b;">
+                <th style="padding:8px;">User ID</th>
+                <th style="padding:8px;">Display Name</th>
+                <th style="padding:8px;">Status</th>
+                <th style="padding:8px;">Requested At</th>
+                <th style="padding:8px;">Action / Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${storePasswordResetsList.map(r => `
+                <tr style="border-bottom:1px solid #e2e8f0;">
+                  <td style="padding:10px 8px;"><code>${esc(r.user_id)}</code></td>
+                  <td style="padding:10px 8px;"><b>${esc(r.display_name || r.user_id)}</b></td>
+                  <td style="padding:10px 8px;">
+                    <span class="badge ${r.status === 'pending' ? 'orange' : r.status === 'approved' ? 'green' : 'red'}">${esc(r.status)}</span>
+                  </td>
+                  <td style="padding:10px 8px;" class="muted">${new Date(r.created_at).toLocaleString()}</td>
+                  <td style="padding:10px 8px;">
+                    ${r.status === 'pending' ? `
+                      <button class="primary approveResetBtn" data-id="${r.id}" data-user="${esc(r.user_id)}" style="padding:4px 10px;font-size:12px;margin-right:6px;">✓ Approve</button>
+                      <button class="danger rejectResetBtn" data-id="${r.id}" data-user="${esc(r.user_id)}" style="padding:4px 10px;font-size:12px;">✕ Reject</button>
+                    ` : r.status === 'approved' ? `
+                      <span class="muted" style="font-size:12px;">Approved by ${esc(r.approved_by || 'Admin')}</span>
+                    ` : `
+                      <span class="muted" style="font-size:12px;">Rejected</span>
+                    `}
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        ` : '<div class="empty">No password reset requests for this store.</div>'}
+      </div>
+    </div>
   `;
 }
 
@@ -2249,6 +2273,32 @@ function wire() {
     if (!confirm(`Reactivate store access for member '${name}' (${user})?`)) return;
     try {
       const res = await api(`/api/stores/${activeStoreId}/members/${id}/activate`, { method: 'POST' });
+      toast(res.message);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.approveResetBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    if (!confirm(`Approve password reset request for operator '${user}'?`)) return;
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/password-resets/${id}/approve`, { method: 'POST' });
+      alert(`Password reset approved for ${user}!\n\nSingle-Use Reset Token:\n${res.resetToken}\n\nPlease provide this token to the operator to enter on the password reset screen.`);
+      await load();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+
+  document.querySelectorAll('.rejectResetBtn').forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    const user = b.dataset.user;
+    if (!confirm(`Reject password reset request for operator '${user}'?`)) return;
+    try {
+      const res = await api(`/api/stores/${activeStoreId}/password-resets/${id}/reject`, { method: 'POST' });
       toast(res.message);
       await load();
     } catch (e) {

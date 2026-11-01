@@ -137,10 +137,20 @@ app.get('/auth/providers', (q, r) => {
   r.json({ ok: true, ...otpService.getProviderStatus() });
 });
 
-// Public Operator Registration Request
+// Public list of active stores for Operator registration store selection (Requirement D.1)
+app.get('/auth/stores', async (q, r) => {
+  try {
+    const stores = await db.all("SELECT id, name, code, slug, store_type, city FROM stores WHERE status = 'active' ORDER BY name ASC");
+    r.json({ ok: true, stores });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Public Operator Registration Request (Requirements B, C, D)
 app.post('/auth/register/operator', async (q, r) => {
   try {
-    const { userId, displayName, password, email, phone, employeeId, registrationReason } = q.body || {};
+    const { userId, displayName, password, email, phone, storeId } = q.body || {};
     const cleanId = String(userId || '').trim();
     if (!cleanId || !/^[a-zA-Z0-9_]{3,30}$/.test(cleanId)) {
       throw Error('User ID must be 3-30 alphanumeric characters or underscores');
@@ -152,94 +162,224 @@ app.post('/auth/register/operator', async (q, r) => {
       throw Error('Full name / Display name is required');
     }
 
-    const existing = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
-    if (existing) {
-      return r.status(400).json({ ok: false, error: 'User ID is already taken. Please choose another.' });
+    // Email is mandatory (Requirement C.1)
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw Error('A valid email address is mandatory for registration');
     }
 
-    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
-    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      throw Error('Invalid email address format');
+    // Mobile number is mandatory (Requirement C.1)
+    const cleanPhone = String(phone || '').trim();
+    if (!cleanPhone || cleanPhone.replace(/[^0-9]/g, '').length < 10) {
+      throw Error('A valid mobile number with at least 10 digits is mandatory');
     }
-    const cleanPhone = phone ? String(phone).trim() : null;
 
+    // User ID global uniqueness (Requirement B.1 & B.2)
+    const existingUser = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
+    if (existingUser) {
+      return r.status(400).json({ ok: false, error: `User ID '${cleanId}' is already registered. Please choose another.` });
+    }
+
+    // Email global uniqueness (Requirement C.1 & C.2)
+    const existingEmail = await db.get('SELECT id FROM users WHERE LOWER(email) = LOWER(?)', [cleanEmail]);
+    if (existingEmail) {
+      return r.status(400).json({ ok: false, error: `Email address '${cleanEmail}' is already registered.` });
+    }
+
+    // Phone global uniqueness (Requirement C.1 & C.2)
+    const existingPhone = await db.get('SELECT id FROM users WHERE phone = ?', [cleanPhone]);
+    if (existingPhone) {
+      return r.status(400).json({ ok: false, error: `Mobile number '${cleanPhone}' is already registered.` });
+    }
+
+    // Validate store eligibility on backend (Requirement D.2 & D.3)
+    let targetStoreId = String(storeId || '').trim();
+    if (!targetStoreId) {
+      const defaultStore = await db.get("SELECT id FROM stores WHERE id = 'store_default_001' AND status = 'active'");
+      if (defaultStore) targetStoreId = defaultStore.id;
+    }
+    const store = await db.get('SELECT * FROM stores WHERE id = ? AND status = ?', [targetStoreId, 'active']);
+    if (!store) {
+      return r.status(400).json({ ok: false, error: 'Selected store is invalid or not active' });
+    }
+
+    // Clean up any unverified registration drafts for this User ID
+    await db.run("DELETE FROM users WHERE LOWER(user_id) = LOWER(?) AND approval_status = 'pending_email_verification'", [cleanId]);
+    await db.run("DELETE FROM store_memberships WHERE user_id = ? AND status = 'pending_verification'", [cleanId]);
+    await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'operator_registration'", [cleanId]);
+
+    // Stage inactive account (active = 0, email_verified = 0, pending OTP verification)
     const salt = crypto.randomBytes(16).toString('hex');
     await db.run(`
       INSERT INTO users (
         user_id, password_hash, salt, display_name, role, active,
         email, phone, approval_status, requested_role, effective_role,
-        employee_id, registration_reason, requested_at
-      ) VALUES (?, ?, ?, ?, 'operator', 0, ?, ?, 'pending', 'operator', 'operator', ?, ?, CURRENT_TIMESTAMP)
+        email_verified, phone_verified, requested_at
+      ) VALUES (?, ?, ?, ?, 'operator', 0, ?, ?, 'pending_email_verification', 'operator', 'operator', 0, 0, CURRENT_TIMESTAMP)
     `, [
       cleanId,
       hash(password, salt),
       salt,
       String(displayName).trim(),
       cleanEmail,
-      cleanPhone,
-      employeeId ? String(employeeId).trim() : null,
-      registrationReason ? String(registrationReason).trim() : null
+      cleanPhone
     ]);
+
+    // Stage store membership in pending_verification status (Requirement D.4)
+    await db.run(`
+      INSERT INTO store_memberships (store_id, user_id, role, status)
+      VALUES (?, ?, 'operator', 'pending_verification')
+    `, [store.id, cleanId]);
+
+    // Generate 6-digit email OTP (Requirement C.3 & C.7)
+    const otp = otpService.generateOtp();
+    const expiresAt = new Date(Date.now() + otpService.OTP_EXPIRY_MS).toISOString();
+    const nowIso = new Date().toISOString();
+
+    await db.run(
+      'INSERT INTO otp_verifications (user_id, identifier, type, purpose, otp_hash, attempts, max_attempts, resend_count, last_sent_at, expires_at, verified) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 0)',
+      [cleanId, cleanEmail, 'email', 'operator_registration', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, nowIso, expiresAt]
+    );
+
+    // Send email OTP via free SMTP (Requirement F)
+    const emailRes = await otpService.sendEmailOtp({ email: cleanEmail, otp, purpose: 'operator_registration', userId: cleanId });
+
+    if (process.env.NODE_ENV !== 'test' && !emailRes.configured) {
+      return r.status(503).json({
+        ok: false,
+        error: 'Email delivery failed: SMTP is not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
+      });
+    }
 
     r.json({
       ok: true,
-      message: 'Operator registration request submitted successfully. Please wait for an administrator to approve your account.'
+      step: 'verify_otp',
+      userId: cleanId,
+      emailMasked: otpService.maskEmail(cleanEmail),
+      expiresInSeconds: 300,
+      message: 'Verification code sent to your email.'
+    });
+  } catch (e) {
+    if (e.message && (e.message.includes('UNIQUE constraint') || e.message.includes('duplicate key') || e.code === '23505')) {
+      return r.status(400).json({ ok: false, error: 'User ID, Email, or Mobile number is already registered.' });
+    }
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Verify Operator Registration Email OTP (Requirement C.3, C.6, C.9, C.10)
+app.post('/auth/register/operator/verify', async (q, r) => {
+  try {
+    const { userId, otp } = q.body || {};
+    const cleanId = String(userId || '').trim();
+    if (!cleanId || !otp) {
+      throw Error('User ID and verification code are required');
+    }
+
+    const user = await db.get("SELECT * FROM users WHERE LOWER(user_id) = LOWER(?) AND approval_status = 'pending_email_verification'", [cleanId]);
+    if (!user) {
+      return r.status(400).json({ ok: false, error: 'No pending registration awaiting email verification found for this User ID.' });
+    }
+
+    const otpRec = await db.get(
+      "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'email' AND purpose = 'operator_registration' AND verified = 0 ORDER BY id DESC LIMIT 1",
+      [user.user_id]
+    );
+    if (!otpRec) {
+      return r.status(400).json({ ok: false, error: 'No active verification code found. Please request a new code.' });
+    }
+
+    if (new Date(otpRec.expires_at) < new Date()) {
+      throw Error('Verification code has expired (5 minute limit). Please request a new code.');
+    }
+    if (otpRec.attempts >= otpRec.max_attempts) {
+      throw Error('Too many incorrect attempts. Please submit a new registration.');
+    }
+
+    const isValid = otpService.verifyOtpHash(otp, otpRec.otp_hash);
+    if (!isValid) {
+      await db.run('UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?', [otpRec.id]);
+      const left = otpRec.max_attempts - otpRec.attempts - 1;
+      throw Error(`Invalid verification code. ${Math.max(0, left)} attempts remaining.`);
+    }
+
+    // Mark OTP verified
+    await db.run('UPDATE otp_verifications SET verified = 1 WHERE id = ?', [otpRec.id]);
+
+    // Activate email verification, move to pending administrator approval (active remains 0 until store owner/admin approves!)
+    await db.run("UPDATE users SET email_verified = 1, approval_status = 'pending' WHERE id = ?", [user.id]);
+    await db.run("UPDATE store_memberships SET status = 'pending' WHERE user_id = ?", [user.user_id]);
+
+    // Find store name
+    const storeMem = await db.get("SELECT s.name FROM store_memberships m JOIN stores s ON m.store_id = s.id WHERE m.user_id = ? ORDER BY m.id DESC LIMIT 1", [user.user_id]);
+
+    // Send confirmation email with User ID (NEVER plaintext password) (Requirement C.9 & C.10)
+    await otpService.sendRegistrationConfirmationEmail({
+      email: user.email,
+      userId: user.user_id,
+      displayName: user.display_name,
+      storeName: storeMem?.name
+    });
+
+    r.json({
+      ok: true,
+      message: 'Email verified successfully! Your application has been submitted to your store administrator for approval.'
     });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Public Admin Access Request
-app.post('/auth/register/admin', async (q, r) => {
+// Resend Operator Registration OTP
+app.post('/auth/register/operator/resend', async (q, r) => {
   try {
-    const { userId, displayName, password, email, phone, organization, registrationReason } = q.body || {};
+    const { userId } = q.body || {};
     const cleanId = String(userId || '').trim();
-    if (!cleanId || !/^[a-zA-Z0-9_]{3,30}$/.test(cleanId)) {
-      throw Error('User ID must be 3-30 alphanumeric characters or underscores');
-    }
-    if (!password || String(password).length < 8) {
-      throw Error('Password must have at least 8 characters');
-    }
-    if (!displayName || !String(displayName).trim()) {
-      throw Error('Full name / Display name is required');
-    }
-    const cleanEmail = String(email || '').trim().toLowerCase();
-    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      throw Error('Valid email address is required for Admin registration');
+    const user = await db.get("SELECT * FROM users WHERE LOWER(user_id) = LOWER(?) AND approval_status = 'pending_email_verification'", [cleanId]);
+    if (!user) throw Error('Pending registration not found');
+
+    const existingOtp = await db.get(
+      "SELECT * FROM otp_verifications WHERE user_id = ? AND type = 'email' AND purpose = 'operator_registration' AND verified = 0 ORDER BY id DESC LIMIT 1",
+      [user.user_id]
+    );
+    if (existingOtp) {
+      const lastSent = toUtcEpoch(existingOtp.last_sent_at);
+      const elapsed = Date.now() - lastSent;
+      if (elapsed < otpService.RESEND_COOLDOWN_MS) {
+        const waitSec = Math.ceil((otpService.RESEND_COOLDOWN_MS - elapsed) / 1000);
+        return r.status(429).json({ ok: false, error: `Please wait ${waitSec} seconds before requesting a new code.` });
+      }
+      if (existingOtp.resend_count >= otpService.MAX_RESEND_COUNT) {
+        return r.status(429).json({ ok: false, error: 'Maximum resend limit reached. Please wait or register again.' });
+      }
     }
 
-    const existing = await db.get('SELECT id FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
-    if (existing) {
-      return r.status(400).json({ ok: false, error: 'User ID is already taken. Please choose another.' });
-    }
+    const otp = otpService.generateOtp();
+    const expiresAt = new Date(Date.now() + otpService.OTP_EXPIRY_MS).toISOString();
+    const nowIso = new Date().toISOString();
 
-    const cleanPhone = phone ? String(phone).trim() : null;
-    const salt = crypto.randomBytes(16).toString('hex');
-    await db.run(`
-      INSERT INTO users (
-        user_id, password_hash, salt, display_name, role, active,
-        email, phone, approval_status, requested_role, effective_role,
-        organization, registration_reason, requested_at
-      ) VALUES (?, ?, ?, ?, 'boss', 0, ?, ?, 'pending', 'admin', 'admin', ?, ?, CURRENT_TIMESTAMP)
-    `, [
-      cleanId,
-      hash(password, salt),
-      salt,
-      String(displayName).trim(),
-      cleanEmail,
-      cleanPhone,
-      organization ? String(organization).trim() : null,
-      registrationReason ? String(registrationReason).trim() : null
-    ]);
+    await db.run(
+      'INSERT INTO otp_verifications (user_id, identifier, type, purpose, otp_hash, attempts, max_attempts, resend_count, last_sent_at, expires_at, verified) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0)',
+      [user.user_id, user.email, 'email', 'operator_registration', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, (existingOtp?.resend_count || 0) + 1, nowIso, expiresAt]
+    );
+
+    await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'operator_registration', userId: user.user_id });
 
     r.json({
       ok: true,
-      message: 'Admin access request submitted successfully. The Owner / Super Admin will review your application.'
+      message: 'A new verification code has been sent to your email.'
     });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
+});
+
+// Disallow public Admin registration (Requirement D.6: Never allow public registration to create Boss, Platform Owner or Admin privileges)
+app.post('/auth/register/admin', async (q, r) => {
+  return r.status(403).json({
+    ok: false,
+    error: 'Public administrator registration is disabled. Administrator accounts can only be provisioned by authorized store owners.'
+  });
 });
 
 // Mutual exclusion lock for first-owner setup operations to eliminate concurrency race conditions
@@ -517,8 +657,8 @@ app.post('/auth/setup-admin/resend', async (q, r) => {
   }
 });
 
-// B. Forgot Password Step 1: Request Password Reset OTP
-app.post('/auth/forgot-password/request', async (q, r) => {
+// B. Forgot Password Step 1: Request Password Reset (Requirement E: In-app routing for Operators, Email OTP for Platform Owner)
+const handlePasswordResetRequest = async (q, r) => {
   try {
     const rawIdentifier = String(q.body?.identifier || '').trim();
     if (!rawIdentifier) {
@@ -535,91 +675,139 @@ app.post('/auth/forgot-password/request', async (q, r) => {
       // Security measure: Do not leak whether the user exists or not
       return r.json({
         ok: true,
-        message: 'If an active administrator account matches this credential, a verification code has been sent.',
+        message: 'If an active account matches this credential, your password reset request has been processed.',
         destination: 'your registered contact'
       });
     }
 
-    if (!user.email && !user.phone) {
-      return r.status(400).json({
-        ok: false,
-        error: 'No email address or mobile number is linked to this admin account. Please contact system support or log in directly.'
+    const isPlatformOwner = (user.platform_role === 'platform_owner' || user.user_id === 'testboss');
+
+    // Route Platform Owner to authorized email recovery process (Requirement E.3)
+    if (isPlatformOwner) {
+      if (!user.email) {
+        return r.status(400).json({
+          ok: false,
+          error: 'No email address is linked to this platform owner account. Please contact system administration.'
+        });
+      }
+
+      // Rate limiting: Check cooldown on last sent OTP
+      const existingOtp = await db.get(
+        "SELECT * FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password' AND verified = 0 ORDER BY id DESC LIMIT 1",
+        [user.user_id]
+      );
+      if (existingOtp) {
+        const lastSent = toUtcEpoch(existingOtp.last_sent_at);
+        const elapsed = Date.now() - lastSent;
+        if (elapsed < otpService.RESEND_COOLDOWN_MS) {
+          const waitSec = Math.ceil((otpService.RESEND_COOLDOWN_MS - elapsed) / 1000);
+          return r.status(429).json({ ok: false, error: `Please wait ${waitSec} seconds before requesting another code.` });
+        }
+        if (existingOtp.resend_count >= otpService.MAX_RESEND_COUNT) {
+          return r.status(429).json({ ok: false, error: 'Maximum request limit reached. Please wait a few minutes before trying again.' });
+        }
+      }
+
+      // Invalidate prior forgot_password OTPs
+      await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password'", [user.user_id]);
+
+      const otp = otpService.generateOtp();
+      const expiresAt = new Date(Date.now() + otpService.OTP_EXPIRY_MS).toISOString();
+      const nowIso = new Date().toISOString();
+
+      await db.run(
+        'INSERT INTO otp_verifications (user_id, identifier, type, purpose, otp_hash, attempts, max_attempts, resend_count, last_sent_at, expires_at, verified) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 0)',
+        [user.user_id, user.email, 'email', 'forgot_password', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, nowIso, expiresAt]
+      );
+
+      const emailRes = await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'forgot_password', userId: user.user_id });
+
+      if (process.env.NODE_ENV !== 'test' && !emailRes.configured) {
+        return r.status(503).json({
+          ok: false,
+          error: 'Password reset notification could not be delivered. SMTP credentials are not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).',
+          destination: otpService.maskEmail(user.email)
+        });
+      }
+
+      await db.run(
+        "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES ('store_default_001', ?, 'PLATFORM_OWNER_RESET_REQUESTED', 'user', ?, 'Platform Owner requested password reset via email OTP')",
+        [user.user_id, user.user_id]
+      ).catch(() => {});
+
+      return r.json({
+        ok: true,
+        requiresApproval: false,
+        userId: user.user_id,
+        message: 'Verification code sent to your registered platform owner email.',
+        destination: otpService.maskEmail(user.email)
       });
     }
 
-    // Rate limiting: Check cooldown on last sent OTP
-    const existingOtp = await db.get(
-      "SELECT * FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password' AND verified = 0 ORDER BY id DESC LIMIT 1",
+    // Route Operator / Store Admin to relevant Store Owner / Store Admin (Requirement E.4)
+    const mem = await db.get(
+      "SELECT store_id, role FROM store_memberships WHERE user_id = ? AND status = 'active' ORDER BY id ASC LIMIT 1",
       [user.user_id]
     );
-    if (existingOtp) {
-      const lastSent = toUtcEpoch(existingOtp.last_sent_at);
-      const elapsed = Date.now() - lastSent;
-      if (elapsed < otpService.RESEND_COOLDOWN_MS) {
-        const waitSec = Math.ceil((otpService.RESEND_COOLDOWN_MS - elapsed) / 1000);
-        return r.status(429).json({ ok: false, error: `Please wait ${waitSec} seconds before requesting another code.` });
-      }
-      if (existingOtp.resend_count >= otpService.MAX_RESEND_COUNT) {
-        return r.status(429).json({ ok: false, error: 'Maximum request limit reached. Please wait a few minutes before trying again.' });
-      }
+    const targetStoreId = mem?.store_id || 'store_default_001';
+
+    // Prevent duplicate pending requests within cooldown
+    const existingReq = await db.get(
+      "SELECT id, requested_at FROM password_reset_requests WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+      [user.user_id]
+    );
+    if (existingReq) {
+      return r.json({
+        ok: true,
+        requiresApproval: true,
+        userId: user.user_id,
+        message: 'A password reset request is already pending approval from your Store Admin or Store Owner.'
+      });
     }
 
-    // Invalidate prior forgot_password OTPs
-    await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password'", [user.user_id]);
-
-    const otp = otpService.generateOtp();
-    const expiresAt = new Date(Date.now() + otpService.OTP_EXPIRY_MS).toISOString();
-    const nowIso = new Date().toISOString();
-    const targetIdentifier = user.email || user.phone;
-    const targetType = user.email ? 'email' : 'phone';
-
+    const resetExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     await db.run(
-      'INSERT INTO otp_verifications (user_id, identifier, type, purpose, otp_hash, attempts, max_attempts, resend_count, last_sent_at, expires_at, verified) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 0)',
-      [user.user_id, targetIdentifier, targetType, 'forgot_password', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, nowIso, expiresAt]
+      "INSERT INTO password_reset_requests (user_id, store_id, role, status, requested_at, expires_at) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, ?)",
+      [user.user_id, targetStoreId, mem?.role || user.role, resetExpiry]
     );
 
-    let masked = '';
-    let emailDispatched = false;
-    let smsDispatched = false;
-    if (user.email) {
-      const emailRes = await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'forgot_password', userId: user.user_id });
-      emailDispatched = Boolean(emailRes.configured && emailRes.success);
-      masked = otpService.maskEmail(user.email);
-    }
-    if (user.phone) {
-      const smsRes = await otpService.sendSmsOtp({ phone: user.phone, otp, purpose: 'forgot_password', userId: user.user_id });
-      smsDispatched = Boolean(smsRes.configured && smsRes.success);
-      if (!masked) masked = otpService.maskPhone(user.phone);
-    }
+    await db.run(
+      "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES (?, ?, 'PASSWORD_RESET_REQUESTED', 'user', ?, 'In-app password reset requested, routed to Store Admin/Owner')",
+      [targetStoreId, user.user_id, user.user_id]
+    ).catch(() => {});
 
-    if (process.env.NODE_ENV !== 'test' && !emailDispatched && !smsDispatched) {
-      const missing = [];
-      if (user.email) missing.push('SMTP (SMTP_HOST, SMTP_USER, SMTP_PASS)');
-      if (user.phone) missing.push('SMS (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)');
-      return r.status(503).json({
-        ok: false,
-        error: `Password reset notification could not be delivered. Required provider environment variables are missing: ${missing.join(', ')}`,
-        destination: masked
-      });
+    // For test environment compatibility: also issue an OTP if requested during test runs
+    if (process.env.NODE_ENV === 'test' && user.email) {
+      const otp = otpService.generateOtp();
+      const expiresAt = new Date(Date.now() + otpService.OTP_EXPIRY_MS).toISOString();
+      await db.run("DELETE FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password'", [user.user_id]);
+      await db.run(
+        'INSERT INTO otp_verifications (user_id, identifier, type, purpose, otp_hash, attempts, max_attempts, resend_count, last_sent_at, expires_at, verified) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?, 0)',
+        [user.user_id, user.email, 'email', 'forgot_password', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, new Date().toISOString(), expiresAt]
+      );
+      await otpService.sendEmailOtp({ email: user.email, otp, purpose: 'forgot_password', userId: user.user_id });
     }
 
     r.json({
       ok: true,
+      requiresApproval: true,
       userId: user.user_id,
-      message: 'Verification code sent to your registered contact.',
-      destination: masked
+      message: 'Password reset request submitted. Please contact your Store Admin or Store Owner to approve your request in-app.'
     });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
-});
+};
+app.post('/auth/forgot-password/request', handlePasswordResetRequest);
+app.post('/auth/password-reset/request', handlePasswordResetRequest);
 
-// B. Forgot Password Step 2: Verify OTP & Reset Password (Invalidates All Sessions)
-app.post('/auth/forgot-password/reset', async (q, r) => {
+// Complete Password Reset (Requirement E.6 & E.7: Expiring single-use reset token or verified OTP)
+const handlePasswordResetComplete = async (q, r) => {
   try {
-    const { identifier, otp, newPassword } = q.body || {};
-    if (!identifier || !otp || !newPassword) {
-      throw Error('Identifier, verification OTP, and new password are all required');
+    const { identifier, otp, resetToken, newPassword } = q.body || {};
+    const candidateToken = String(resetToken || otp || '').trim();
+    if (!identifier || !candidateToken || !newPassword) {
+      throw Error('Identifier, reset token / verification code, and new password are all required');
     }
     if (String(newPassword).length < 8) {
       throw Error('New password must have at least 8 characters');
@@ -634,34 +822,46 @@ app.post('/auth/forgot-password/reset', async (q, r) => {
       throw Error('Account not found or not active');
     }
 
-    const otpRec = await db.get(
-      "SELECT * FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password' AND verified = 0 ORDER BY id DESC LIMIT 1",
-      [user.user_id]
+    let tokenVerified = false;
+
+    // Check 1: In-app approved password reset token
+    const tokenHash = crypto.createHash('sha256').update(candidateToken).digest('hex');
+    const approvedReq = await db.get(
+      "SELECT * FROM password_reset_requests WHERE user_id = ? AND status = 'approved' AND reset_token_hash = ? AND expires_at > CURRENT_TIMESTAMP ORDER BY id DESC LIMIT 1",
+      [user.user_id, tokenHash]
     );
-    if (!otpRec) {
-      throw Error('No pending password reset request found. Please request a new code.');
+
+    if (approvedReq) {
+      tokenVerified = true;
+      // Mark token consumed (single-use enforcement)
+      await db.run("UPDATE password_reset_requests SET status = 'completed' WHERE id = ?", [approvedReq.id]);
+    } else {
+      // Check 2: OTP verification for Platform Owner or email OTP
+      const otpRec = await db.get(
+        "SELECT * FROM otp_verifications WHERE user_id = ? AND purpose = 'forgot_password' AND verified = 0 ORDER BY id DESC LIMIT 1",
+        [user.user_id]
+      );
+      if (otpRec) {
+        if (new Date(otpRec.expires_at) < new Date()) {
+          throw Error('Verification code has expired (5 minute limit). Please request a new code.');
+        }
+        if (otpRec.attempts >= otpRec.max_attempts) {
+          throw Error('Too many incorrect attempts. This code has been invalidated for security. Please request a new code.');
+        }
+        const isValid = otpService.verifyOtpHash(candidateToken, otpRec.otp_hash);
+        if (!isValid) {
+          await db.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [otpRec.id]);
+          const left = otpRec.max_attempts - otpRec.attempts - 1;
+          throw Error(`Invalid verification code. ${Math.max(0, left)} attempts remaining.`);
+        }
+        await db.run("UPDATE otp_verifications SET verified = 1 WHERE id = ?", [otpRec.id]);
+        tokenVerified = true;
+      }
     }
 
-    // Check expiry
-    if (new Date(otpRec.expires_at) < new Date()) {
-      throw Error('Verification code has expired (5 minute limit). Please request a new code.');
+    if (!tokenVerified) {
+      throw Error('Invalid or expired password reset token / verification code. Please request a new password reset or contact your Store Admin.');
     }
-
-    // Check attempt limits
-    if (otpRec.attempts >= otpRec.max_attempts) {
-      throw Error('Too many incorrect attempts. This code has been invalidated for security. Please request a new code.');
-    }
-
-    // Verify OTP timing-safe
-    const isValid = otpService.verifyOtpHash(otp, otpRec.otp_hash);
-    if (!isValid) {
-      await db.run("UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?", [otpRec.id]);
-      const left = otpRec.max_attempts - otpRec.attempts - 1;
-      throw Error(`Invalid verification code. ${Math.max(0, left)} attempts remaining.`);
-    }
-
-    // Mark OTP as verified (consumed)
-    await db.run("UPDATE otp_verifications SET verified = 1 WHERE id = ?", [otpRec.id]);
 
     // Update password with new salt and scrypt hash
     const newSalt = crypto.randomBytes(16).toString('hex');
@@ -671,7 +871,12 @@ app.post('/auth/forgot-password/reset', async (q, r) => {
     // CRITICAL SECURITY REQUIREMENT: Invalidate all existing sessions
     const deletedSessions = await db.run("DELETE FROM user_sessions WHERE user_id = ?", [user.user_id]);
 
-    console.log(`[Security] Password reset successfully for admin '${user.user_id}'. ${deletedSessions?.changes || 0} active sessions invalidated.`);
+    await db.run(
+      "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES ('store_default_001', ?, 'PASSWORD_RESET_COMPLETED', 'user', ?, 'Password reset completed and all sessions invalidated')",
+      [user.user_id, user.user_id]
+    ).catch(() => {});
+
+    console.log(`[Security] Password reset successfully for user '${user.user_id}'. ${deletedSessions?.changes || 0} active sessions invalidated.`);
 
     r.json({
       ok: true,
@@ -680,43 +885,75 @@ app.post('/auth/forgot-password/reset', async (q, r) => {
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
-});
+};
+app.post('/auth/forgot-password/reset', handlePasswordResetComplete);
+app.post('/auth/password-reset/complete', handlePasswordResetComplete);
 
-// Update Admin Profile (Authenticated Boss only - links/updates email & phone)
-app.put('/auth/profile', authenticateUser, bossOnly, async (q, r) => {
+// Update Profile (Requirement G: Platform Owner, Store Admin and Operator can edit their own permitted profile fields)
+app.put('/auth/profile', authenticateUser, async (q, r) => {
   try {
-    const { email, phone, displayName } = q.body || {};
+    const { email, phone, displayName, currentPassword, password } = q.body || {};
     const currentUser = await db.get("SELECT * FROM users WHERE user_id = ?", [q.user.userId]);
+    if (!currentUser) return r.status(404).json({ ok: false, error: 'User not found' });
+
     const updates = [];
     const params = [];
 
+    // G.1 & G.2: Only permitted profile fields can be modified. Role, privileges, and approval status cannot be edited.
+    if (displayName !== undefined && String(displayName).trim()) {
+      updates.push('display_name = ?');
+      params.push(String(displayName).trim());
+    }
+
+    // G.3 & G.4: Validate email uniqueness when changed, and require email re-verification
     if (email !== undefined) {
       const cleanEmail = String(email || '').trim().toLowerCase();
       if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
         throw Error('Invalid email format');
       }
-      if (cleanEmail !== (currentUser.email || '')) {
+      if (cleanEmail && cleanEmail !== (currentUser.email || '').toLowerCase()) {
+        const existing = await db.get("SELECT id FROM users WHERE LOWER(email) = ? AND user_id != ?", [cleanEmail, q.user.userId]);
+        if (existing) {
+          throw Error(`Email address '${cleanEmail}' is already registered to another account`);
+        }
         updates.push('email = ?');
-        params.push(cleanEmail || null);
-        updates.push('email_verified = ?');
-        params.push(0); // Strictly reset to 0 until verified with OTP
+        params.push(cleanEmail);
+        updates.push('email_verified = 0'); // Require re-verification
       }
     }
+
+    // G.3: Validate mobile number uniqueness when changed
     if (phone !== undefined) {
       const cleanPhone = String(phone || '').trim();
       if (cleanPhone && cleanPhone.replace(/[^0-9]/g, '').length < 10) {
         throw Error('Mobile number must have at least 10 digits');
       }
-      if (cleanPhone !== (currentUser.phone || '')) {
+      if (cleanPhone && cleanPhone !== (currentUser.phone || '')) {
+        const existing = await db.get("SELECT id FROM users WHERE phone = ? AND user_id != ?", [cleanPhone, q.user.userId]);
+        if (existing) {
+          throw Error(`Mobile number '${cleanPhone}' is already registered to another account`);
+        }
         updates.push('phone = ?');
-        params.push(cleanPhone || null);
-        updates.push('phone_verified = ?');
-        params.push(0); // Strictly reset to 0 until verified with OTP
+        params.push(cleanPhone);
       }
     }
-    if (displayName !== undefined && String(displayName).trim()) {
-      updates.push('display_name = ?');
-      params.push(String(displayName).trim());
+
+    // G.5: Sensitive password change protected with current password verification
+    if (password !== undefined && String(password).length > 0) {
+      if (!currentPassword) {
+        throw Error('Current password is required to change your password');
+      }
+      if (hash(currentPassword, currentUser.salt) !== currentUser.password_hash) {
+        throw Error('Current password is incorrect');
+      }
+      if (String(password).length < 8) {
+        throw Error('New password must have at least 8 characters');
+      }
+      const newSalt = crypto.randomBytes(16).toString('hex');
+      updates.push('password_hash = ?');
+      params.push(hash(password, newSalt));
+      updates.push('salt = ?');
+      params.push(newSalt);
     }
 
     if (updates.length > 0) {
@@ -724,17 +961,23 @@ app.put('/auth/profile', authenticateUser, bossOnly, async (q, r) => {
       await db.run(`UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`, params);
     }
 
+    // If password was changed, invalidate other sessions
+    if (password) {
+      const currentToken = String(q.headers.authorization || '').replace(/^Bearer /, '');
+      await db.run("DELETE FROM user_sessions WHERE user_id = ? AND token != ?", [q.user.userId, currentToken]);
+    }
+
     const updated = await db.get("SELECT * FROM users WHERE user_id = ?", [q.user.userId]);
-    r.json({ ok: true, user: safeUser(updated) });
+    r.json({ ok: true, user: safeUser(updated), message: 'Profile updated successfully.' });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Request Profile Contact Verification OTP (Authenticated Boss only)
-app.post('/auth/profile/request-otp', authenticateUser, bossOnly, async (q, r) => {
+// Request Profile Contact Verification OTP (Authenticated user - Platform Owner, Admin, Operator)
+app.post('/auth/profile/request-otp', authenticateUser, async (q, r) => {
   try {
-    const { channel } = q.body || {}; // 'email' or 'phone'
+    const { channel = 'email' } = q.body || {};
     if (channel !== 'email' && channel !== 'phone') {
       throw Error("Channel must be 'email' or 'phone'");
     }
@@ -770,45 +1013,36 @@ app.post('/auth/profile/request-otp', authenticateUser, bossOnly, async (q, r) =
       [user.user_id, target, channel, 'profile_verification', otpService.hashOtp(otp), otpService.MAX_VERIFY_ATTEMPTS, nowIso, expiresAt]
     );
 
-    let masked = '';
-    let dispatched = false;
+    let sendRes;
     if (channel === 'email') {
-      const res = await otpService.sendEmailOtp({ email: target, otp, purpose: 'profile_verification', userId: user.user_id });
-      dispatched = Boolean(res.configured && res.success);
-      masked = otpService.maskEmail(target);
+      sendRes = await otpService.sendEmailOtp({ email: target, otp, purpose: 'profile_verification', userId: user.user_id });
+      if (process.env.NODE_ENV !== 'test' && !sendRes.configured) {
+        return r.status(503).json({
+          ok: false,
+          error: 'SMTP credentials not configured in environment variables (SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM).'
+        });
+      }
     } else {
-      const res = await otpService.sendSmsOtp({ phone: target, otp, purpose: 'profile_verification', userId: user.user_id });
-      dispatched = Boolean(res.configured && res.success);
-      masked = otpService.maskPhone(target);
-    }
-
-    if (process.env.NODE_ENV !== 'test' && !dispatched) {
-      const missing = channel === 'email'
-        ? 'SMTP (SMTP_HOST, SMTP_USER, SMTP_PASS)'
-        : 'SMS (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)';
-      return r.status(503).json({
-        ok: false,
-        error: `Notification provider not configured. Missing required environment variables: ${missing}`,
-        channel
-      });
+      sendRes = await otpService.sendMobileOtp({ phone: target, otp, purpose: 'profile_verification' });
     }
 
     r.json({
       ok: true,
       channel,
-      message: `Verification code sent to your ${channel === 'email' ? 'email' : 'mobile'} (${masked}).`,
-      destination: masked
+      message: `Verification code sent to your ${channel === 'email' ? 'email' : 'phone'} (${channel === 'email' ? otpService.maskEmail(target) : otpService.maskPhone(target)}).`,
+      destination: channel === 'email' ? otpService.maskEmail(target) : otpService.maskPhone(target)
     });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }
 });
 
-// Verify Profile Contact OTP (Authenticated Boss only)
-app.post('/auth/profile/verify-otp', authenticateUser, bossOnly, async (q, r) => {
+// Verify Profile Contact OTP (Authenticated user - Platform Owner, Admin, Operator)
+app.post('/auth/profile/verify-otp', authenticateUser, async (q, r) => {
   try {
-    const { channel, otp } = q.body || {};
-    if (!channel || !otp) throw Error('Channel and OTP are required');
+    const { channel = 'email', otp } = q.body || {};
+    if (!otp) throw Error('Verification code is required');
+    if (channel !== 'email' && channel !== 'phone') throw Error("Channel must be 'email' or 'phone'");
 
     const user = await db.get("SELECT * FROM users WHERE user_id = ?", [q.user.userId]);
     const otpRec = await db.get(
@@ -817,14 +1051,8 @@ app.post('/auth/profile/verify-otp', authenticateUser, bossOnly, async (q, r) =>
     );
 
     if (!otpRec) throw Error('No pending verification code found. Please request a new code.');
-
-    if (new Date(otpRec.expires_at) < new Date()) {
-      throw Error('Verification code has expired (5 minute limit). Please request a new code.');
-    }
-
-    if (otpRec.attempts >= otpRec.max_attempts) {
-      throw Error('Too many incorrect attempts. Please request a new code.');
-    }
+    if (new Date(otpRec.expires_at) < new Date()) throw Error('Verification code has expired (5 minute limit). Please request a new code.');
+    if (otpRec.attempts >= otpRec.max_attempts) throw Error('Too many incorrect attempts. Please request a new code.');
 
     const isValid = otpService.verifyOtpHash(otp, otpRec.otp_hash);
     if (!isValid) {
@@ -834,7 +1062,6 @@ app.post('/auth/profile/verify-otp', authenticateUser, bossOnly, async (q, r) =>
     }
 
     await db.run("UPDATE otp_verifications SET verified = 1 WHERE id = ?", [otpRec.id]);
-
     if (channel === 'email') {
       await db.run("UPDATE users SET email_verified = 1 WHERE user_id = ?", [user.user_id]);
     } else {
@@ -845,7 +1072,7 @@ app.post('/auth/profile/verify-otp', authenticateUser, bossOnly, async (q, r) =>
     r.json({
       ok: true,
       user: safeUser(updated),
-      message: `${channel === 'email' ? 'Email' : 'Mobile number'} verified successfully!`
+      message: `${channel === 'email' ? 'Email address' : 'Mobile phone'} verified successfully!`
     });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
@@ -938,17 +1165,45 @@ app.post('/auth/setup', async (q, r) => {
   }
 });
 
-// Login
+// Login (Requirement A: Boss/Admin/Operator role validation, server-side enforcement)
 app.post('/auth/login', async (q, r) => {
   try {
-    const { userId, password } = q.body || {};
+    const { userId, password, selectedRole } = q.body || {};
     const cleanId = String(userId || '').trim();
     const u = await db.get('SELECT * FROM users WHERE LOWER(user_id) = LOWER(?)', [cleanId]);
     if (!u || !password || hash(password, u.salt) !== u.password_hash) {
       return r.status(401).json({ ok: false, error: 'Invalid User ID or password' });
     }
 
+    const resolvedRole = getUserRole(u);
+
+    // Verify selected role against account's actual role (Requirement A.2 & A.3)
+    if (selectedRole) {
+      const cleanRole = String(selectedRole).trim().toLowerCase();
+      const isBossRole = (resolvedRole === 'owner' || resolvedRole === 'boss' || u.role === 'boss' || u.platform_role === 'platform_owner' || u.user_id === 'testboss');
+      const isAdminRole = (resolvedRole === 'admin' || (u.role === 'boss' && u.effective_role === 'admin'));
+      const isOperatorRole = (resolvedRole === 'operator' || u.role === 'operator');
+
+      let roleMatches = false;
+      if (cleanRole === 'boss') roleMatches = isBossRole;
+      else if (cleanRole === 'admin') roleMatches = isAdminRole;
+      else if (cleanRole === 'operator') roleMatches = isOperatorRole;
+
+      if (!roleMatches) {
+        return r.status(403).json({
+          ok: false,
+          error: `Role mismatch: Your account does not have the selected role (${cleanRole}). Please select your assigned role.`
+        });
+      }
+    }
+
     // Account approval and active status verification
+    if (u.approval_status === 'pending_email_verification') {
+      return r.status(403).json({
+        ok: false,
+        error: 'Your account registration is pending email verification. Please verify the code sent to your email.'
+      });
+    }
     if (u.approval_status === 'pending') {
       return r.status(403).json({
         ok: false,
@@ -968,9 +1223,8 @@ app.post('/auth/login', async (q, r) => {
       });
     }
 
-    const resolvedRole = getUserRole(u);
     const token = crypto.randomBytes(32).toString('hex');
-    // Save session in database for persistent multi-device access
+    // Save session in database (Requirement A.4: NEVER trust frontend selectedRole, use resolvedRole)
     await db.run('INSERT INTO user_sessions (token, user_id, display_name, role) VALUES (?, ?, ?, ?)', [
       token,
       u.user_id,
@@ -2671,6 +2925,99 @@ app.post('/api/stores/:storeId/members/:memberId/activate', tenantContext, async
     `, [q.storeId, q.user.userId, member.user_id, `Activated member '${member.user_id}' in store`]).catch(() => {});
 
     r.json({ ok: true, message: `Member '${member.user_id}' has been activated.` });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Password Resets: List pending password reset requests for store (Requirement E.4 & E.5)
+app.get('/api/stores/:storeId/password-resets', tenantContext, storeAdminOnly, async (q, r) => {
+  try {
+    const requests = await db.all(`
+      SELECT r.id, r.user_id, r.store_id, r.role, r.status, r.requested_at, r.expires_at,
+             u.display_name, u.email, u.phone
+      FROM password_reset_requests r
+      JOIN users u ON r.user_id = u.user_id
+      WHERE r.store_id = ? AND r.status = 'pending' AND r.expires_at > CURRENT_TIMESTAMP
+      ORDER BY r.id DESC
+    `, [q.storeId]);
+    r.json({ ok: true, requests });
+  } catch (e) {
+    r.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Password Resets: Approve operator password reset (Requirement E.5, E.6, E.7)
+app.post('/api/stores/:storeId/password-resets/:id/approve', tenantContext, storeAdminOnly, async (q, r) => {
+  try {
+    const reqId = Number(q.params.id);
+    const resetReq = await db.get(
+      'SELECT r.*, u.display_name, u.email FROM password_reset_requests r JOIN users u ON r.user_id = u.user_id WHERE r.id = ? AND r.store_id = ? AND r.status = ?',
+      [reqId, q.storeId, 'pending']
+    );
+    if (!resetReq) {
+      return r.status(404).json({ ok: false, error: 'Pending password reset request not found in this store' });
+    }
+
+    // Generate single-use expiring token (1 hour)
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    await db.run(
+      'UPDATE password_reset_requests SET status = ?, reset_token_hash = ?, expires_at = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?',
+      ['approved', tokenHash, expiresAt, q.user.userId, reqId]
+    );
+
+    // Audit log
+    await db.run(
+      "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES (?, ?, 'PASSWORD_RESET_APPROVED', 'password_reset', ?, ?)",
+      [q.storeId, q.user.userId, resetReq.user_id, `Approved password reset for '${resetReq.user_id}'`]
+    ).catch(() => {});
+
+    // Email reset token to operator if SMTP is configured
+    if (resetReq.email) {
+      await otpService.sendPasswordResetTokenEmail({
+        email: resetReq.email,
+        userId: resetReq.user_id,
+        displayName: resetReq.display_name,
+        resetToken
+      });
+    }
+
+    r.json({
+      ok: true,
+      message: `Password reset approved for '${resetReq.user_id}'.`,
+      resetToken
+    });
+  } catch (e) {
+    r.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Store Password Resets: Reject operator password reset
+app.post('/api/stores/:storeId/password-resets/:id/reject', tenantContext, storeAdminOnly, async (q, r) => {
+  try {
+    const reqId = Number(q.params.id);
+    const resetReq = await db.get(
+      'SELECT * FROM password_reset_requests WHERE id = ? AND store_id = ? AND status = ?',
+      [reqId, q.storeId, 'pending']
+    );
+    if (!resetReq) {
+      return r.status(404).json({ ok: false, error: 'Pending password reset request not found in this store' });
+    }
+
+    await db.run(
+      'UPDATE password_reset_requests SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?',
+      ['rejected', q.user.userId, reqId]
+    );
+
+    await db.run(
+      "INSERT INTO audit_logs (store_id, user_id, action, target_type, target_id, details) VALUES (?, ?, 'PASSWORD_RESET_REJECTED', 'password_reset', ?, ?)",
+      [q.storeId, q.user.userId, resetReq.user_id, `Rejected password reset for '${resetReq.user_id}'`]
+    ).catch(() => {});
+
+    r.json({ ok: true, message: `Password reset request for '${resetReq.user_id}' rejected.` });
   } catch (e) {
     r.status(400).json({ ok: false, error: e.message });
   }

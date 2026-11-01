@@ -728,8 +728,62 @@ test('17. Admin Role Boundaries: Admin can manage operators and product metadata
   assert.equal(pendingOps.data.ok, true);
 });
 
-test('18. Operator Registration & Admin Approval Lifecycle', async () => {
-  // 1. Public Operator registration request
+test('18. Operator Registration & Verification Lifecycle with Mandatory Store & Email OTP (Phase 8)', async () => {
+  const otpService = require('../otp-service');
+  let capturedOpOtp = null;
+  otpService.setTestOtpListener(({ type, otp, purpose }) => {
+    if ((purpose === 'registration' || purpose === 'operator_registration') && type === 'email') {
+      capturedOpOtp = otp;
+    }
+  });
+
+  // 1. Fetch active stores for registration
+  const storesRes = await api('/auth/stores');
+  assert.equal(storesRes.status, 200);
+  assert.ok(storesRes.data.stores.length > 0, 'Active stores must be available for operator registration');
+  const targetStoreId = storesRes.data.stores[0].id;
+
+  // 2. Operator registration requires mandatory email, phone, and valid storeId
+  const missingEmailRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      displayName: 'Bob Operator',
+      storeId: targetStoreId
+    })
+  });
+  assert.equal(missingEmailRes.status, 400);
+  assert.match(missingEmailRes.data.error, /email.*mandatory/i);
+
+  const missingPhoneRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      displayName: 'Bob Operator',
+      email: 'bob@warehouse.com',
+      storeId: targetStoreId
+    })
+  });
+  assert.equal(missingPhoneRes.status, 400);
+  assert.match(missingPhoneRes.data.error, /mobile.*mandatory/i);
+
+  const invalidStoreRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      displayName: 'Bob Operator',
+      email: 'bob@warehouse.com',
+      phone: '+919876543888',
+      storeId: 'invalid_store_xyz'
+    })
+  });
+  assert.equal(invalidStoreRes.status, 400);
+  assert.match(invalidStoreRes.data.error, /Selected store is invalid/i);
+
+  // 3. Public Operator registration request with all mandatory fields
   const regRes = await api('/auth/register/operator', {
     method: 'POST',
     body: JSON.stringify({
@@ -737,25 +791,82 @@ test('18. Operator Registration & Admin Approval Lifecycle', async () => {
       password: 'OperatorPass456!',
       displayName: 'Bob Operator',
       email: 'bob@warehouse.com',
-      employeeId: 'EMP-101',
-      registrationReason: 'Night shift picker'
+      phone: '+919876543888',
+      storeId: targetStoreId
     })
   });
   assert.equal(regRes.status, 200);
   assert.equal(regRes.data.ok, true);
+  assert.ok(capturedOpOtp, 'Registration email OTP generated');
 
-  // Prevent duplicate registration
-  const dupRes = await api('/auth/register/operator', {
+  // 4. Prevent duplicate user ID
+  const dupUserRes = await api('/auth/register/operator', {
     method: 'POST',
     body: JSON.stringify({
       userId: 'new_operator_bob',
-      password: 'OperatorPass456!',
-      displayName: 'Bob Operator'
+      password: 'AnotherPass123!',
+      displayName: 'Duplicate Bob',
+      email: 'unique_bob@warehouse.com',
+      phone: '+919876543299',
+      storeId: targetStoreId
     })
   });
-  assert.equal(dupRes.status, 400);
+  assert.equal(dupUserRes.status, 400);
+  assert.match(dupUserRes.data.error, /User ID 'new_operator_bob' is already registered/i);
 
-  // 2. Pending operator CANNOT login -> 403
+  // 5. Prevent duplicate email
+  const dupEmailRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'bob_alt',
+      password: 'AnotherPass123!',
+      displayName: 'Duplicate Email Bob',
+      email: 'bob@warehouse.com',
+      phone: '+919876543298',
+      storeId: targetStoreId
+    })
+  });
+  assert.equal(dupEmailRes.status, 400);
+  assert.match(dupEmailRes.data.error, /email.*already/i);
+
+  // 6. Prevent duplicate mobile phone
+  const dupPhoneRes = await api('/auth/register/operator', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'bob_phone_dup',
+      password: 'AnotherPass123!',
+      displayName: 'Duplicate Phone Bob',
+      email: 'unique_email_bob@warehouse.com',
+      phone: '+919876543888',
+      storeId: targetStoreId
+    })
+  });
+  assert.equal(dupPhoneRes.status, 400);
+  assert.match(dupPhoneRes.data.error, /mobile number.*already registered/i);
+
+  // 6. Inactive account cannot login before OTP verification
+  const preOtpLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!'
+    })
+  });
+  assert.equal(preOtpLogin.status, 403);
+  assert.match(preOtpLogin.data.error, /pending email verification/i);
+
+  // 7. Verify Email OTP activates account into pending store admin review
+  const verifyRes = await api('/auth/register/operator/verify', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      otp: capturedOpOtp
+    })
+  });
+  assert.equal(verifyRes.status, 200);
+  assert.equal(verifyRes.data.ok, true);
+
+  // 8. Pending operator CANNOT login before admin approval -> 403
   const loginPending = await api('/auth/login', {
     method: 'POST',
     body: JSON.stringify({
@@ -766,16 +877,15 @@ test('18. Operator Registration & Admin Approval Lifecycle', async () => {
   assert.equal(loginPending.status, 403);
   assert.match(loginPending.data.error, /pending administrator approval/i);
 
-  // 3. Admin views pending operator queue
+  // 9. Admin views pending operator queue
   const queueRes = await api('/api/admin/pending-operators', {
     headers: { Authorization: `Bearer ${adminToken}` }
   });
   assert.equal(queueRes.status, 200);
   const targetReq = queueRes.data.requests.find(r => r.user_id === 'new_operator_bob');
   assert.ok(targetReq, 'Pending operator should appear in queue');
-  assert.equal(targetReq.employee_id, 'EMP-101');
 
-  // 4. Admin approves the operator
+  // 10. Admin approves the operator
   const approveRes = await api(`/api/admin/operators/${targetReq.id}/approve`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${adminToken}` }
@@ -783,7 +893,7 @@ test('18. Operator Registration & Admin Approval Lifecycle', async () => {
   assert.equal(approveRes.status, 200);
   assert.equal(approveRes.data.ok, true);
 
-  // 5. Approved operator CAN now login
+  // 11. Approved operator CAN now login
   const loginOk = await api('/auth/login', {
     method: 'POST',
     body: JSON.stringify({
@@ -796,7 +906,7 @@ test('18. Operator Registration & Admin Approval Lifecycle', async () => {
   assert.equal(loginOk.data.user.approvalStatus, 'approved');
   const bobToken = loginOk.data.token;
 
-  // 6. Approved operator can store/retrieve
+  // 12. Approved operator can store/retrieve
   const bobStore = await api('/store', {
     method: 'POST',
     headers: { Authorization: `Bearer ${bobToken}` },
@@ -811,8 +921,8 @@ test('18. Operator Registration & Admin Approval Lifecycle', async () => {
   });
 });
 
-test('19. Admin Registration & Owner-Only Approval Lifecycle', async () => {
-  // 1. Public Admin registration request
+test('19. Admin Registration Restriction & Owner Provisioning Lifecycle (Phase 8)', async () => {
+  // 1. Public Admin registration is blocked with 403
   const regRes = await api('/auth/register/admin', {
     method: 'POST',
     body: JSON.stringify({
@@ -820,60 +930,39 @@ test('19. Admin Registration & Owner-Only Approval Lifecycle', async () => {
       password: 'AdminSecurePass789!',
       displayName: 'Alice Manager',
       email: 'alice@warehouse.com',
-      phone: '+919876543299',
-      organization: 'Logistics Operations',
-      registrationReason: 'Lead shift supervisor'
+      phone: '+919876543299'
     })
   });
-  assert.equal(regRes.status, 200);
-  assert.equal(regRes.data.ok, true);
+  assert.equal(regRes.status, 403);
+  assert.match(regRes.data.error, /disabled.*store owners/i);
 
-  // 2. Pending admin CANNOT login -> 403
-  const loginPending = await api('/auth/login', {
+  // 2. Fetch active store for provisioning
+  const storesRes = await api('/auth/stores');
+  const targetStoreId = storesRes.data.stores[0].id;
+
+  // 3. Store Owner provisions Store Admin via store members endpoint
+  const addAdminRes = await api(`/api/stores/${targetStoreId}/members`, {
     method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` },
     body: JSON.stringify({
-      userId: 'candidate_admin_alice',
-      password: 'AdminSecurePass789!'
+      userId: 'store_admin_alice',
+      role: 'store_admin',
+      displayName: 'Alice Store Manager',
+      password: 'AdminSecurePass789!',
+      email: 'alice_admin@warehouse.com',
+      phone: '+919876543299'
     })
   });
-  assert.equal(loginPending.status, 403);
-  assert.match(loginPending.data.error, /pending administrator approval/i);
+  assert.equal(addAdminRes.status, 200);
+  assert.equal(addAdminRes.data.ok, true);
 
-  // 3. Other Admin CANNOT approve candidate admin -> 403
-  const queueRes = await api('/api/owner/pending-admins', {
-    headers: { Authorization: `Bearer ${adminToken}` }
-  });
-  assert.equal(queueRes.status, 403);
-
-  // 4. Owner views pending admin queue
-  const ownerQueueRes = await api('/api/owner/pending-admins', {
-    headers: { Authorization: `Bearer ${bossToken}` }
-  });
-  assert.equal(ownerQueueRes.status, 200);
-  const targetReq = ownerQueueRes.data.requests.find(r => r.user_id === 'candidate_admin_alice');
-  assert.ok(targetReq, 'Pending admin request must exist in owner queue');
-  assert.equal(targetReq.organization, 'Logistics Operations');
-
-  // 5. Admin attempts to approve -> 403
-  const adminAttemptApprove = await api(`/api/owner/admins/${targetReq.id}/approve`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${adminToken}` }
-  });
-  assert.equal(adminAttemptApprove.status, 403);
-
-  // 6. Owner approves candidate admin
-  const ownerApprove = await api(`/api/owner/admins/${targetReq.id}/approve`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${bossToken}` }
-  });
-  assert.equal(ownerApprove.status, 200);
-
-  // 7. Approved admin CAN now login with admin role
+  // 4. Provisioned admin logs in with Admin role
   const loginOk = await api('/auth/login', {
     method: 'POST',
     body: JSON.stringify({
-      userId: 'candidate_admin_alice',
-      password: 'AdminSecurePass789!'
+      userId: 'store_admin_alice',
+      password: 'AdminSecurePass789!',
+      selectedRole: 'admin'
     })
   });
   assert.equal(loginOk.status, 200);
@@ -2214,4 +2303,254 @@ test('51. First-Time Admin OTP Activation Concurrency: Concurrent /auth/setup-ad
     await db.run("UPDATE users SET active = 1 WHERE user_id = 'testboss'");
     await db.run("UPDATE stores SET owner_user_id = 'testboss' WHERE id = 'store_default_001'");
   }
+});
+
+test('52. Phase 8 Login Role Selection & Verification (Requirement A)', async () => {
+  // 1. Platform Owner / Boss login
+  // Succeeded with selectedRole = 'boss'
+  const bossLoginOk = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'testboss', password: 'UpdatedSecurePass2026!', selectedRole: 'boss' })
+  });
+  assert.equal(bossLoginOk.status, 200);
+  assert.equal(bossLoginOk.data.user.role, 'owner');
+
+  // Mismatched role: Boss selecting 'operator' is rejected with 403
+  const bossWrongRole = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'testboss', password: 'UpdatedSecurePass2026!', selectedRole: 'operator' })
+  });
+  assert.equal(bossWrongRole.status, 403);
+  assert.match(bossWrongRole.data.error, /Role mismatch/i);
+
+  // Mismatched role: Boss selecting 'admin' is rejected with 403
+  const bossWrongRole2 = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'testboss', password: 'UpdatedSecurePass2026!', selectedRole: 'admin' })
+  });
+  assert.equal(bossWrongRole2.status, 403);
+  assert.match(bossWrongRole2.data.error, /Role mismatch/i);
+
+  // 2. Operator login
+  // Succeeded with selectedRole = 'operator'
+  const opLoginOk = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!', selectedRole: 'operator' })
+  });
+  assert.equal(opLoginOk.status, 200);
+  assert.equal(opLoginOk.data.user.role, 'operator');
+
+  // Mismatched role: Operator selecting 'boss' is rejected with 403
+  const opWrongRole = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!', selectedRole: 'boss' })
+  });
+  assert.equal(opWrongRole.status, 403);
+  assert.match(opWrongRole.data.error, /Role mismatch/i);
+
+  // Mismatched role: Operator selecting 'admin' is rejected with 403
+  const opWrongRole2 = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!', selectedRole: 'admin' })
+  });
+  assert.equal(opWrongRole2.status, 403);
+  assert.match(opWrongRole2.data.error, /Role mismatch/i);
+
+  // 3. Authorization is never derived from frontend role selection (Requirement A.4)
+  // Even if request omits selectedRole, session role in DB is strictly derived from user record
+  const apiLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'test_op', password: 'NewOperatorPass999!' })
+  });
+  assert.equal(apiLogin.status, 200);
+  const session = await db.get('SELECT role FROM user_sessions WHERE token = ?', [apiLogin.data.token]);
+  assert.equal(session.role, 'operator');
+});
+
+test('53. Phase 8 In-App Operator Password Reset Approval Flow (Requirement E)', async () => {
+  // Look up Bob's assigned store
+  const bobMem = await db.get("SELECT store_id FROM store_memberships WHERE user_id = 'new_operator_bob' AND status = 'active'");
+  const targetStoreId = bobMem ? bobMem.store_id : 'store_default_001';
+
+  // 1. Operator requests password reset
+  const resetReq = await api('/auth/forgot-password/request', {
+    method: 'POST',
+    body: JSON.stringify({ identifier: 'new_operator_bob' })
+  });
+  assert.equal(resetReq.status, 200);
+  assert.equal(resetReq.data.requiresApproval, true);
+  assert.match(resetReq.data.message, /approve.*request in-app|in-app/i);
+
+  // 2. Pending request appears in Store Admin / Owner list
+  const listRes = await api(`/api/stores/${targetStoreId}/password-resets`, {
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(listRes.status, 200);
+  const targetReq = listRes.data.requests.find(r => r.user_id === 'new_operator_bob' && r.status === 'pending');
+  assert.ok(targetReq, 'Pending reset request must be listed for store staff review');
+
+  // 3. Store Admin approves the reset request and receives one-time token
+  const approveRes = await api(`/api/stores/${targetStoreId}/password-resets/${targetReq.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bossToken}` }
+  });
+  assert.equal(approveRes.status, 200);
+  assert.ok(approveRes.data.resetToken, 'Single-use reset token returned upon approval');
+  const singleUseToken = approveRes.data.resetToken;
+
+  // 4. Operator completes password reset using the token
+  const newBobPass = 'NewBobSecurePass2026!';
+  const resetDone = await api('/auth/forgot-password/reset', {
+    method: 'POST',
+    body: JSON.stringify({
+      identifier: 'new_operator_bob',
+      resetToken: singleUseToken,
+      newPassword: newBobPass
+    })
+  });
+  assert.equal(resetDone.status, 200);
+  assert.equal(resetDone.data.ok, true);
+
+  // 5. Operator logs in with new password
+  const bobNewLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: newBobPass,
+      selectedRole: 'operator'
+    })
+  });
+  assert.equal(bobNewLogin.status, 200);
+
+  // 6. Old password fails
+  const bobOldLogin = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      userId: 'new_operator_bob',
+      password: 'OperatorPass456!',
+      selectedRole: 'operator'
+    })
+  });
+  assert.equal(bobOldLogin.status, 401);
+
+  // 7. Token replay fails (single-use enforcement)
+  const replayReset = await api('/auth/forgot-password/reset', {
+    method: 'POST',
+    body: JSON.stringify({
+      identifier: 'new_operator_bob',
+      resetToken: singleUseToken,
+      newPassword: 'AnotherPassword999!'
+    })
+  });
+  assert.equal(replayReset.status, 400);
+});
+
+test('54. Phase 8 Profile Editing Permissions & Password Change Verification (Requirement G)', async () => {
+  // Login as operator bob
+  const loginRes = await api('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ userId: 'new_operator_bob', password: 'NewBobSecurePass2026!' })
+  });
+  const bobToken = loginRes.data.token;
+
+  // 1. Operator updates displayName and phone (Permitted fields)
+  const editRes = await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      displayName: 'Bob The Builder',
+      phone: '+919876543777'
+    })
+  });
+  assert.equal(editRes.status, 200);
+  assert.equal(editRes.data.user.displayName, 'Bob The Builder');
+  assert.equal(editRes.data.user.phone, '+919876543777');
+
+  // 2. Role escalation attempt is strictly rejected or ignored (Role remains operator)
+  await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      role: 'boss',
+      platform_role: 'platform_owner'
+    })
+  });
+  const checkUser = await db.get("SELECT role, platform_role FROM users WHERE user_id = 'new_operator_bob'");
+  assert.equal(checkUser.role, 'operator');
+  assert.equal(checkUser.platform_role, null);
+
+  // 3. Changing password with wrong current password fails (400)
+  const badPassChange = await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      currentPassword: 'WrongPassword123!',
+      password: 'BrandNewPass2026!'
+    })
+  });
+  assert.equal(badPassChange.status, 400);
+  assert.match(badPassChange.data.error, /Current password is incorrect/i);
+
+  // 4. Changing password with correct current password succeeds (200)
+  const goodPassChange = await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      currentPassword: 'NewBobSecurePass2026!',
+      password: 'BrandNewPass2026!'
+    })
+  });
+  assert.equal(goodPassChange.status, 200);
+  assert.equal(goodPassChange.data.ok, true);
+
+  // 5. Changing email resets email_verified to 0
+  const changeEmailRes = await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      email: 'bob_new_email@warehouse.com'
+    })
+  });
+  assert.equal(changeEmailRes.status, 200);
+  assert.equal(changeEmailRes.data.user.email_verified, 0);
+
+  // 6. Duplicate email in profile update is rejected (400)
+  const dupEmailEdit = await api('/auth/profile', {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${bobToken}` },
+    body: JSON.stringify({
+      email: 'alice_admin@warehouse.com'
+    })
+  });
+  assert.equal(dupEmailEdit.status, 400);
+  assert.match(dupEmailEdit.data.error, /already/i);
+});
+
+test('55. Phase 8 Free SMTP Email Configuration and Zero-Cost Contract (Requirements C.7, F.1, F.2)', async () => {
+  const otpService = require('../otp-service');
+
+  // 1. Provider status reflects absence of SMTP credentials cleanly
+  const providerStatus = otpService.getProviderStatus();
+  assert.equal(typeof providerStatus.email.configured, 'boolean');
+  assert.match(providerStatus.email.provider, /SMTP/i);
+
+  // 2. Zero-cost confirmation email function does NOT leak password
+  const confirmationResult = await otpService.sendRegistrationConfirmationEmail({
+    email: 'recipient@warehouse.com',
+    userId: 'audit_operator_01',
+    displayName: 'Audit Operator',
+    storeName: 'Test Warehouse'
+  });
+  assert.equal(typeof confirmationResult.configured, 'boolean');
+  assert.equal(typeof confirmationResult.success, 'boolean');
+
+  // 3. Password reset token email function executes safely without crashing
+  const resetTokenResult = await otpService.sendPasswordResetTokenEmail({
+    email: 'recipient@warehouse.com',
+    userId: 'audit_operator_01',
+    displayName: 'Audit Operator',
+    resetToken: 'test_token_123456'
+  });
+  assert.equal(typeof resetTokenResult.configured, 'boolean');
+  assert.equal(typeof resetTokenResult.success, 'boolean');
 });

@@ -22,7 +22,8 @@
     <h1 id="loginTitle">Welcome back</h1>
     <p id="loginHint">Sign in to your warehouse control center.</p>
     <div class="role-choice" id="roleChoice">
-      <button type="button" class="role active" data-role="boss">♛ &nbsp; Boss / Admin</button>
+      <button type="button" class="role active" data-role="boss">♛ &nbsp; Boss</button>
+      <button type="button" class="role" data-role="admin">♚ &nbsp; Admin</button>
       <button type="button" class="role" data-role="operator">⚙ &nbsp; Operator</button>
     </div>
     <div id="setupFields" class="form hidden">
@@ -40,7 +41,7 @@
       <input id="setupUser" placeholder="Choose a User ID" autocomplete="username">
       <label for="setupEmail">Admin Email (for OTP verification)</label>
       <input id="setupEmail" type="email" placeholder="admin@company.com" autocomplete="email">
-      <label for="setupPhone">Mobile Number (for SMS OTP)</label>
+      <label for="setupPhone">Mobile Number</label>
       <input id="setupPhone" type="tel" placeholder="+919876543210" autocomplete="tel">
       <label for="setupPass">Create password</label>
       <div class="password-wrap">
@@ -50,11 +51,9 @@
     </div>
     <div id="setupOtpFields" class="form hidden">
       <div class="setup-section">VERIFY ADMIN IDENTITY (OTP)</div>
-      <p class="form-desc">Verification codes sent to your email and mobile. Valid for 5 minutes.</p>
+      <p class="form-desc">Verification code sent to your email. Valid for 5 minutes.</p>
       <label for="setupEmailOtp">Email Verification Code</label>
       <input id="setupEmailOtp" type="text" maxlength="6" placeholder="Enter 6-digit Email OTP" autocomplete="one-time-code">
-      <label for="setupPhoneOtp">Mobile SMS Verification Code</label>
-      <input id="setupPhoneOtp" type="text" maxlength="6" placeholder="Enter 6-digit Mobile OTP" autocomplete="one-time-code">
       <div class="otp-resend-row">
         <span id="setupOtpTimer">Expires in 5:00</span>
         <button type="button" id="setupResendBtn" class="link-btn" disabled>Resend Code</button>
@@ -73,17 +72,17 @@
       </div>
     </div>
     <div id="forgotFields" class="form hidden">
-      <div class="setup-section">ADMIN PASSWORD RECOVERY</div>
+      <div class="setup-section">PASSWORD RECOVERY</div>
       <div id="forgotStep1">
-        <p class="form-desc">Enter your registered User ID, Email address, or Mobile number to receive a recovery code.</p>
+        <p class="form-desc">Enter your registered User ID, Email address, or Mobile number to initiate password reset.</p>
         <label for="forgotIdentifier">User ID / Email / Mobile</label>
-        <input id="forgotIdentifier" placeholder="e.g. testboss or boss@company.com">
-        <button type="button" id="forgotSendBtn" class="primary wide">Send Verification Code →</button>
+        <input id="forgotIdentifier" placeholder="e.g. testboss or operator@store.com">
+        <button type="button" id="forgotSendBtn" class="primary wide">Send Reset Request →</button>
       </div>
       <div id="forgotStep2" class="hidden">
         <p class="form-desc" id="forgotDestLabel">Verification code sent to your registered contact.</p>
-        <label for="forgotOtp">Enter 6-digit Code</label>
-        <input id="forgotOtp" type="text" maxlength="6" placeholder="6-digit OTP" autocomplete="one-time-code">
+        <label for="forgotOtp">Enter 6-digit Code / Reset Token</label>
+        <input id="forgotOtp" type="text" placeholder="6-digit OTP or Reset Token" autocomplete="one-time-code">
         <label for="forgotNewPass">New Password</label>
         <div class="password-wrap">
           <input id="forgotNewPass" type="password" placeholder="At least 8 characters" autocomplete="new-password">
@@ -91,11 +90,18 @@
         </div>
         <label for="forgotConfirmPass">Confirm New Password</label>
         <input id="forgotConfirmPass" type="password" placeholder="Re-enter new password">
-        <div class="otp-resend-row">
+        <div class="otp-resend-row" id="forgotResendRow">
           <span id="forgotOtpTimer">Expires in 5:00</span>
           <button type="button" id="forgotResendBtn" class="link-btn" disabled>Resend Code</button>
         </div>
         <button type="button" id="forgotResetBtn" class="primary wide">Reset Password & Invalidate Sessions →</button>
+      </div>
+      <div id="forgotStepApproval" class="hidden">
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 14px; margin: 12px 0;">
+          <h4 style="margin: 0 0 6px 0; color: #0284c7;">Request Under In-App Review</h4>
+          <p id="forgotApprovalMsg" style="margin: 0; font-size: 13px; color: #334155;">Your password reset request has been routed to your Store Admin / Store Owner for in-app approval.</p>
+        </div>
+        <button type="button" id="forgotHaveTokenBtn" class="primary wide">I have an Approved Reset Token →</button>
       </div>
       <div class="form-sub-row center">
         <a href="#" id="forgotBackLink" class="text-link">← Back to Sign in</a>
@@ -107,51 +113,37 @@
 
     <div id="opRegFields" class="form hidden">
       <div class="setup-section">OPERATOR ACCESS APPLICATION</div>
-      <p class="form-desc">Submit an application for warehouse floor operator access. An Administrator will review your request.</p>
-      <label for="opRegUser">Desired User ID *</label>
-      <input id="opRegUser" placeholder="Choose a unique User ID">
-      <label for="opRegName">Full Display Name *</label>
-      <input id="opRegName" placeholder="e.g. John Doe">
-      <label for="opRegPass">Password (min. 8 characters) *</label>
-      <div class="password-wrap">
-        <input id="opRegPass" type="password" placeholder="At least 8 characters">
-        <button type="button" class="show-pass" data-target="opRegPass">Show</button>
+      <p class="form-desc">Apply for floor operator access at an active warehouse or store. Email OTP verification is mandatory.</p>
+      <div id="opRegFormStep">
+        <label for="opRegStore">Assigned Store / Warehouse *</label>
+        <select id="opRegStore" class="search" style="width:100%;max-width:none;padding:12px;">
+          <option value="">Loading active stores...</option>
+        </select>
+        <label for="opRegUser">Desired User ID *</label>
+        <input id="opRegUser" placeholder="Choose a unique User ID">
+        <label for="opRegName">Full Display Name *</label>
+        <input id="opRegName" placeholder="e.g. John Doe">
+        <label for="opRegEmail">Email Address (Mandatory for OTP) *</label>
+        <input id="opRegEmail" type="email" placeholder="john@example.com">
+        <label for="opRegPhone">Mobile Phone (Mandatory) *</label>
+        <input id="opRegPhone" type="tel" placeholder="+919876543210">
+        <label for="opRegPass">Password (min. 8 characters) *</label>
+        <div class="password-wrap">
+          <input id="opRegPass" type="password" placeholder="At least 8 characters">
+          <button type="button" class="show-pass" data-target="opRegPass">Show</button>
+        </div>
+        <button type="button" id="opRegSubmitBtn" class="primary wide" style="margin-top: 14px;">Submit Operator Application →</button>
       </div>
-      <label for="opRegEmail">Email Address (Optional)</label>
-      <input id="opRegEmail" type="email" placeholder="john@example.com">
-      <label for="opRegPhone">Mobile Number (Optional)</label>
-      <input id="opRegPhone" type="tel" placeholder="+919876543210">
-      <label for="opRegEmpId">Employee ID / Badge #</label>
-      <input id="opRegEmpId" placeholder="e.g. EMP-2026">
-      <label for="opRegReason">Reason / Role Justification</label>
-      <input id="opRegReason" placeholder="e.g. Picking & packing on morning shift">
-      <button type="button" id="opRegSubmitBtn" class="primary wide">Submit Operator Application →</button>
-      <div class="form-sub-row center">
-        <a href="#" class="regBackLink text-link">← Back to Sign in</a>
+      <div id="opRegOtpStep" class="hidden">
+        <p class="form-desc" id="opRegOtpDesc">Verification code sent to your email.</p>
+        <label for="opRegOtp">Enter 6-digit Email Verification Code *</label>
+        <input id="opRegOtp" type="text" maxlength="6" placeholder="6-digit OTP" autocomplete="one-time-code">
+        <div class="otp-resend-row">
+          <span id="opRegOtpTimer">Expires in 5:00</span>
+          <button type="button" id="opRegResendBtn" class="link-btn" disabled>Resend Code</button>
+        </div>
+        <button type="button" id="opRegVerifyBtn" class="primary wide">Verify Email & Complete Registration →</button>
       </div>
-    </div>
-
-    <div id="adminRegFields" class="form hidden">
-      <div class="setup-section">ADMINISTRATOR ACCESS APPLICATION</div>
-      <p class="form-desc">Request warehouse manager privileges. Only the Owner / Super Admin can approve new Admin requests.</p>
-      <label for="adminRegUser">Desired Admin User ID *</label>
-      <input id="adminRegUser" placeholder="Choose a unique User ID">
-      <label for="adminRegName">Full Name *</label>
-      <input id="adminRegName" placeholder="e.g. Jane Smith">
-      <label for="adminRegPass">Password (min. 8 characters) *</label>
-      <div class="password-wrap">
-        <input id="adminRegPass" type="password" placeholder="At least 8 characters">
-        <button type="button" class="show-pass" data-target="adminRegPass">Show</button>
-      </div>
-      <label for="adminRegEmail">Official Work Email *</label>
-      <input id="adminRegEmail" type="email" placeholder="jane.smith@company.com">
-      <label for="adminRegPhone">Mobile Number (Optional)</label>
-      <input id="adminRegPhone" type="tel" placeholder="+919876543210">
-      <label for="adminRegOrg">Department / Organization</label>
-      <input id="adminRegOrg" placeholder="e.g. Logistics & Warehouse Operations">
-      <label for="adminRegReason">Business Justification *</label>
-      <input id="adminRegReason" placeholder="e.g. Shift supervisor managing operators & inventory">
-      <button type="button" id="adminRegSubmitBtn" class="primary wide">Submit Admin Application →</button>
       <div class="form-sub-row center">
         <a href="#" class="regBackLink text-link">← Back to Sign in</a>
       </div>
@@ -199,7 +191,6 @@
 
     <div class="login-footer-links" id="loginFooterLinks" style="margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 13px; display: flex; flex-direction: column; gap: 8px;">
       <div>Need warehouse floor access? <a href="#" id="opRegLink" class="text-link">Apply for Operator Access</a></div>
-      <div>Need warehouse manager access? <a href="#" id="adminRegLink" class="text-link">Apply for Admin Access</a></div>
       <div>Starting a new dark store or warehouse? <a href="#" id="storeRegLink" class="text-link">Register New Store / Tenant</a></div>
     </div>
   </div>

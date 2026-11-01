@@ -309,11 +309,26 @@ async function initDb() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS password_reset_requests (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        store_id TEXT,
+        role TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reset_token_hash TEXT,
+        requested_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        reviewed_by TEXT,
+        reviewed_at TIMESTAMP WITH TIME ZONE,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_stores_code ON stores(code);
       CREATE INDEX IF NOT EXISTS idx_store_memberships_user ON store_memberships(user_id);
       CREATE INDEX IF NOT EXISTS idx_store_devices_key ON store_devices(device_key);
       CREATE INDEX IF NOT EXISTS idx_slots_store_id ON slots(store_id);
       CREATE INDEX IF NOT EXISTS idx_transactions_store_id ON transactions(store_id);
+      CREATE INDEX IF NOT EXISTS idx_pw_reset_store ON password_reset_requests(store_id);
+      CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_requests(user_id);
     `);
   } else {
     sqliteDb.exec(`
@@ -475,6 +490,22 @@ async function initDb() {
         details TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
+
+      CREATE TABLE IF NOT EXISTS password_reset_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        store_id TEXT,
+        role TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reset_token_hash TEXT,
+        requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        reviewed_by TEXT,
+        reviewed_at TEXT,
+        expires_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pw_reset_store ON password_reset_requests(store_id);
+      CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_requests(user_id);
     `);
 
     // Ensure SQLite slots table supports composite PRIMARY KEY (store_id, slot) across multiple stores
