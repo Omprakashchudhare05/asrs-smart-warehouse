@@ -64,6 +64,16 @@ menus.boss = menus.owner;
 menus.store_owner = menus.owner;
 menus.store_admin = menus.admin;
 
+const roleLabels = {
+  platform_owner: 'Platform Owner / Super Admin',
+  store_owner: 'Store Owner / Super Admin',
+  owner: 'Store Owner / Super Admin',
+  boss: 'Store Owner / Super Admin',
+  store_admin: 'Store Admin / Manager',
+  admin: 'Store Admin / Manager',
+  operator: 'Floor Operator'
+};
+
 function getCurrentStoreRole() {
   if (isPlatformOwner) return 'platform_owner';
   if (activeStore && activeStore.role) return activeStore.role;
@@ -161,7 +171,7 @@ async function switchStore(newStoreId) {
   }
 
   const role = getCurrentStoreRole();
-  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : (roleLabels[role] || roleLabels[me.role] || 'Warehouse User');
+  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : ((roleLabels && roleLabels[role]) || (roleLabels && me && roleLabels[me.role]) || role || 'Warehouse User');
 
   buildNav();
   buildMobileNav();
@@ -764,7 +774,7 @@ function showApp() {
   $('app').classList.remove('hidden');
   const role = getCurrentStoreRole();
   $('userName').textContent = me.displayName;
-  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : (roleLabels[role] || roleLabels[me.role] || 'Warehouse User');
+  $('userRole').textContent = isPlatformOwner ? 'Platform Owner / Super Admin' : ((roleLabels && roleLabels[role]) || (roleLabels && me && roleLabels[me.role]) || role || 'Warehouse User');
   $('avatar').textContent = (me.displayName || 'U')[0].toUpperCase();
   buildNav();
   buildMobileNav();
@@ -1443,7 +1453,7 @@ function usersPage() {
             <div class="list-row">
               <div>
                 <b>${esc(u.displayName || u.display_name)}</b>
-                <span class="badge ${u.role === 'owner' || u.role === 'boss' ? 'cyan' : u.role === 'admin' ? 'orange' : 'green'}" style="margin-left:6px;">${roleLabels[u.role] || u.role}</span>
+                <span class="badge ${u.role === 'owner' || u.role === 'boss' ? 'cyan' : u.role === 'admin' ? 'orange' : 'green'}" style="margin-left:6px;">${(roleLabels && roleLabels[u.role]) || u.role || 'User'}</span>
                 <div class="muted">${esc(u.userId || u.user_id)} · ${u.active ? 'Active' : 'Disabled'} ${u.email ? '· ' + esc(u.email) : ''}</div>
               </div>
               <div>
@@ -2109,7 +2119,7 @@ function profilePage() {
 
         <label style="margin-top:10px;">Role</label>
         <div>
-          <span class="badge ${me?.role === 'owner' || me?.role === 'boss' ? 'cyan' : me?.role === 'admin' ? 'orange' : 'green'}">${roleLabels[me?.role] || me?.role}</span>
+          <span class="badge ${me?.role === 'owner' || me?.role === 'boss' ? 'cyan' : me?.role === 'admin' ? 'orange' : 'green'}">${(me?.role && roleLabels && roleLabels[me.role]) || me?.role || 'User'}</span>
         </div>
 
         <label style="margin-top:10px;">Display Name</label>
@@ -2752,7 +2762,7 @@ function wire() {
 
 function openMove(code, action = 'store') {
   if (!isFloorOperator()) {
-    toast(`Movement operations are restricted to approved Operators. You are signed in as ${me.displayName} (${roleLabels[getCurrentStoreRole()] || me.role}).`, true);
+    toast(`Movement operations are restricted to approved Operators. You are signed in as ${me?.displayName || 'User'} (${(roleLabels && roleLabels[getCurrentStoreRole()]) || me?.role || 'User'}).`, true);
     return;
   }
   let s = slots.find(x => x.slot === code);
